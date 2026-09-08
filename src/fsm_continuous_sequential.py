@@ -24,7 +24,9 @@ Output: ``outputs/walk_pick_sequential.npz`` (unified schema) + optional
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -47,15 +49,19 @@ def build_sequential_dataset(
     spawn_r_max: float = 3.0,
     videos_dir: Optional[Path | str] = None,
     use_astar: bool = False,
+    failed_dir: Optional[Path | str] = None,
 ) -> dict:
     """Run K single-env episodes and concatenate into one .npz, optionally saving mp4 per episode.
-    Args: K: episode count; base_seed: first episode's seed; out_path: final concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min: inner annulus radius; spawn_r_max: outer annulus radius; videos_dir: if set, writes one mp4 per episode there; use_astar: forward --astar to each subprocess so the walk phase follows an A* path around the pick table.
+    Args: K: episode count; base_seed: first episode's seed; out_path: final concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min: inner annulus radius; spawn_r_max: outer annulus radius; videos_dir: if set, writes one mp4 per episode there; use_astar: forward --astar to each subprocess so the walk phase follows an A* path around the pick table; failed_dir: if set, per-episode .npz of fallen episodes is copied here (plus a metadata.json summarizing all episodes) so the caller can diagnose why the FSM chain fails.
     Returns: dict with total_transitions, pick_successes, walk_kept, pick_kept, per_episode list.
     """
     out_path = Path(out_path)
     if videos_dir is not None:
         videos_dir = Path(videos_dir)
         videos_dir.mkdir(parents=True, exist_ok=True)
+    if failed_dir is not None:
+        failed_dir = Path(failed_dir)
+        failed_dir.mkdir(parents=True, exist_ok=True)
 
     all_obs: list[np.ndarray] = []
     all_act: list[np.ndarray] = []
@@ -115,6 +121,10 @@ def build_sequential_dataset(
 
         if fell_i > 0:
             dropped_fell += 1
+            failed_npz_path = None
+            if failed_dir is not None:
+                failed_npz_path = failed_dir / tmp_npz.name
+                shutil.copy2(tmp_npz, failed_npz_path)
             per_episode.append({
                 "seed": seed_i,
                 "transitions": int(obs_i.shape[0]),
@@ -124,6 +134,7 @@ def build_sequential_dataset(
                 "fell": fell_i,
                 "dropped": True,
                 "video": str(video_path) if video_path else None,
+                "failed_npz": str(failed_npz_path) if failed_npz_path else None,
             })
             print(
                 f"[seq] ep {i:03d} seed={seed_i}: DROPPED (robot fell) "
@@ -141,6 +152,7 @@ def build_sequential_dataset(
             "fell": fell_i,
             "dropped": False,
             "video": str(video_path) if video_path else None,
+            "failed_npz": None,
         })
         print(
             f"[seq] ep {i:03d} seed={seed_i}: "
@@ -164,6 +176,22 @@ def build_sequential_dataset(
         f"({dropped_fell} dropped due to fall; "
         f"{total_pick} pick successes = {total_pick / max(K, 1) * 100:.0f}%)"
     )
+    if failed_dir is not None:
+        metadata_path = failed_dir / "metadata.json"
+        with metadata_path.open("w") as f:
+            json.dump({
+                "episodes": K,
+                "base_seed": base_seed,
+                "max_steps": max_steps,
+                "spawn_r_min": spawn_r_min,
+                "spawn_r_max": spawn_r_max,
+                "use_astar": use_astar,
+                "kept_episodes": kept_eps,
+                "dropped_fell": dropped_fell,
+                "per_episode": per_episode,
+            }, f, indent=2)
+        print(f"[seq] wrote {metadata_path} ({dropped_fell} failed episodes archived)")
+
     # Concat succeeded, so per-episode intermediates are no longer needed for recovery.
     for i in range(K):
         seed_i = base_seed + i
@@ -197,6 +225,7 @@ def _main() -> None:
     ap.add_argument("--r-max", type=float, default=5.0)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--astar", action="store_true", help="Walk phase follows an A* path around the pick table.")
+    ap.add_argument("--failed-dir", default=None, help="If set, per-episode .npz of fallen episodes is copied here plus a metadata.json for offline diagnosis.")
     args = ap.parse_args()
 
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -210,6 +239,7 @@ def _main() -> None:
         spawn_r_max=args.r_max,
         videos_dir=args.videos_dir,
         use_astar=args.astar,
+        failed_dir=args.failed_dir,
     )
 
 
