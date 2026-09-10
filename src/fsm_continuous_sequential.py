@@ -73,6 +73,7 @@ def build_sequential_dataset(
 
     total_pick = 0
     dropped_fell = 0
+    dropped_stuck = 0  # kept upright but never closed pick before max_steps; these frames were the majority of pre-filter data and were teaching the student to flail at the box
     for i in range(K):
         seed_i = base_seed + i
         tmp_npz = tmp_dir / f"ep_{i:03d}_seed{seed_i}.npz"
@@ -133,11 +134,32 @@ def build_sequential_dataset(
                 "pick_success": ep_success,
                 "fell": fell_i,
                 "dropped": True,
+                "drop_reason": "fell",
                 "video": str(video_path) if video_path else None,
                 "failed_npz": str(failed_npz_path) if failed_npz_path else None,
             })
             print(
                 f"[seq] ep {i:03d} seed={seed_i}: DROPPED (robot fell) "
+                f"transitions={obs_i.shape[0]} (walk={walk_i}, pick={pick_i})"
+            )
+            continue
+
+        if ep_success == 0:
+            dropped_stuck += 1
+            per_episode.append({
+                "seed": seed_i,
+                "transitions": int(obs_i.shape[0]),
+                "walk_kept": walk_i,
+                "pick_kept": pick_i,
+                "pick_success": 0,
+                "fell": 0,
+                "dropped": True,
+                "drop_reason": "stuck",
+                "video": str(video_path) if video_path else None,
+                "failed_npz": None,
+            })
+            print(
+                f"[seq] ep {i:03d} seed={seed_i}: DROPPED (stuck at max_steps, never lifted box) "
                 f"transitions={obs_i.shape[0]} (walk={walk_i}, pick={pick_i})"
             )
             continue
@@ -169,11 +191,11 @@ def build_sequential_dataset(
     walk_kept = int((phase == 0).sum())
     pick_kept = int((phase == 1).sum())
     size_mb = out_path.stat().st_size / 1e6
-    kept_eps = K - dropped_fell
+    kept_eps = K - dropped_fell - dropped_stuck
     print(
         f"\n[seq] wrote {out_path} ({size_mb:.1f} MB): {obs.shape[0]} transitions "
         f"(walk={walk_kept}, pick={pick_kept}) over {kept_eps}/{K} kept episodes "
-        f"({dropped_fell} dropped due to fall; "
+        f"({dropped_fell} dropped due to fall, {dropped_stuck} dropped due to stuck-at-max-steps; "
         f"{total_pick} pick successes = {total_pick / max(K, 1) * 100:.0f}%)"
     )
     if failed_dir is not None:
@@ -188,6 +210,7 @@ def build_sequential_dataset(
                 "use_astar": use_astar,
                 "kept_episodes": kept_eps,
                 "dropped_fell": dropped_fell,
+                "dropped_stuck": dropped_stuck,
                 "per_episode": per_episode,
             }, f, indent=2)
         print(f"[seq] wrote {metadata_path} ({dropped_fell} failed episodes archived)")
@@ -203,6 +226,7 @@ def build_sequential_dataset(
         "pick_successes": total_pick,
         "episodes": K,
         "dropped_fell": dropped_fell,
+        "dropped_stuck": dropped_stuck,
         "per_episode": per_episode,
     }
 
