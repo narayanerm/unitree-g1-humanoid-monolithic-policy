@@ -104,6 +104,7 @@ def _rollout_episode(
     lifted = False
     fell = False
     steps = 0
+    brake_counter = 0
 
     for step in range(cfg.max_steps):
         robot = base_env.scene["robot"]
@@ -124,11 +125,14 @@ def _rollout_episode(
             break
 
         upright = up_align > cfg.upright_min
+        in_brake = int(phase_ids[0]) == WALK_PHASE_ID and dist <= cfg.walk_to_pick_dist
+        brake_counter = brake_counter + 1 if in_brake else 0
         if (
             int(phase_ids[0]) == WALK_PHASE_ID
             and upright
             and dist <= cfg.walk_to_pick_dist
             and base_vx < cfg.walk_to_pick_speed_max
+            and brake_counter >= cfg.walk_to_pick_brake_steps
         ):
             phase_ids[0] = PICK_PHASE_ID
             reached_pick = True

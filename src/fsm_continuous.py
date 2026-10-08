@@ -34,6 +34,7 @@ class RolloutConfig:
     seed: int = 7
     walk_to_pick_dist: float = 0.40       # positional envelope: distance to box for pick's trained state distribution
     walk_to_pick_speed_max: float = 0.10  # velocity envelope: pick cannot absorb full walk momentum, brake first
+    walk_to_pick_brake_steps: int = 25    # consecutive frames with twist=0 inside the brake region before the handover fires; pick's reset distribution has joint_vel=lin_vel=ang_vel=0, so firing on the first (dist, vx) match leaves 1.3 rad/s pelvis spin + 7 rad/s joint motion that pushes the pick out of its training manifold (87% of falls happened within 1.6 s of handover before this).
     pick_to_carry_box_z: float = 0.85     # box lifted well above tabletop
     carry_arrival_dist: float = 0.22      # radial gate; combined with carry_x_max=-1.90 fires reliably for the various carry end-poses (y-drift up to 0.16 m)
     drop_success_box_z_max: float = 0.68  # box resting on table 2 top (0.585 + 0.1 margin)

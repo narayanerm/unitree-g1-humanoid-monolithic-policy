@@ -310,6 +310,7 @@ def build_dataset(
     fires_ever = torch.zeros(num_envs, dtype=torch.bool, device=device)
     picked_ever = torch.zeros(num_envs, dtype=torch.bool, device=device)
     fell_ever = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    brake_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
 
     last_action = torch.zeros(num_envs, UNIFIED_ACT_DIM, device=device)
     obs_rec: list[torch.Tensor] = []
@@ -371,6 +372,7 @@ def build_dataset(
         brake_mask = in_walk & (dist <= cfg.walk_to_pick_dist)
         if brake_mask.any():
             twist = torch.where(brake_mask.unsqueeze(-1), torch.zeros_like(twist), twist)
+        brake_counter = torch.where(brake_mask, brake_counter + 1, torch.zeros_like(brake_counter))
 
         walk_obs = _compute_walk_obs(base_env, twist, last_action)
         with torch.no_grad():
@@ -397,6 +399,7 @@ def build_dataset(
             in_walk & upright
             & (dist <= cfg.walk_to_pick_dist)
             & (base_vx < cfg.walk_to_pick_speed_max)
+            & (brake_counter >= cfg.walk_to_pick_brake_steps)
         )
         if fires.any():
             fires_ever |= fires
