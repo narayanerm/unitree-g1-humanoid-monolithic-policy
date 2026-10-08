@@ -372,7 +372,12 @@ def build_dataset(
         brake_mask = in_walk & (dist <= cfg.walk_to_pick_dist)
         if brake_mask.any():
             twist = torch.where(brake_mask.unsqueeze(-1), torch.zeros_like(twist), twist)
-        brake_counter = torch.where(brake_mask, brake_counter + 1, torch.zeros_like(brake_counter))
+        # Latch the counter once we have entered the brake region: subsequent gait oscillation can push dist a few cm above walk_to_pick_dist and a strict consecutive-frames rule would reset the counter on every outward drift, so the handover never fired and episodes ran to max_steps (observed 10x slowdown). Reset only when the env leaves the walk phase (fire or fall).
+        brake_counter = torch.where(
+            in_walk & (brake_mask | (brake_counter > 0)),
+            brake_counter + 1,
+            torch.zeros_like(brake_counter),
+        )
 
         walk_obs = _compute_walk_obs(base_env, twist, last_action)
         with torch.no_grad():

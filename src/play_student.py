@@ -125,10 +125,15 @@ def _rollout_episode(
             break
 
         upright = up_align > cfg.upright_min
-        in_brake = int(phase_ids[0]) == WALK_PHASE_ID and dist <= cfg.walk_to_pick_dist
-        brake_counter = brake_counter + 1 if in_brake else 0
+        in_walk = int(phase_ids[0]) == WALK_PHASE_ID
+        in_brake = in_walk and dist <= cfg.walk_to_pick_dist
+        # Latch: once we have entered the brake region, keep counting while still in walk; gait oscillation can push dist a few cm above the boundary and a strict consecutive-frames rule would reset the count.
+        if in_walk and (in_brake or brake_counter > 0):
+            brake_counter += 1
+        else:
+            brake_counter = 0
         if (
-            int(phase_ids[0]) == WALK_PHASE_ID
+            in_walk
             and upright
             and dist <= cfg.walk_to_pick_dist
             and base_vx < cfg.walk_to_pick_speed_max
