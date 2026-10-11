@@ -83,6 +83,38 @@ def _teleport_robot_batch(base_env, xy: torch.Tensor, z: torch.Tensor, yaw: torc
     robot.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
 
 
+def _override_box_spawn_fsm(
+    base_env,
+    box_x: float,
+    jitter_x: float,
+    jitter_y: float,
+    seed: int,
+) -> None:
+    """Teleport the box to a tighter spawn (``box_x`` +/- ``jitter_x`` on x, box's own y +/- ``jitter_y``).
+    Args: base_env: mjlab env; box_x: nominal world-x of the box center (closer to the -x table edge); jitter_x/jitter_y: half-ranges (m) for uniform noise; seed: RNG seed per episode.
+    Returns: none.
+    FSM-only re-position so policy_pick's training config (BOX_START_X, OBJECT_XY_JITTER_X)
+    stays untouched. Keeps the box's current z and quaternion (the pick env reset already
+    placed it on the tabletop with its own yaw jitter).
+    """
+    from src.policy_pick import BOX_START_Z
+    box = base_env.scene["box"]
+    device = box.data.root_link_pos_w.device
+    n = base_env.num_envs
+    g = torch.Generator(device=device).manual_seed(int(seed) ^ 0xB0CA)
+    cur_pos = box.data.root_link_pos_w.clone()
+    cur_quat = box.data.root_link_quat_w.clone()
+    ox = (2.0 * torch.rand(n, device=device, generator=g) - 1.0) * jitter_x
+    oy = (2.0 * torch.rand(n, device=device, generator=g) - 1.0) * jitter_y
+    env_origins = base_env.scene.env_origins
+    cur_pos[:, 0] = env_origins[:, 0] + box_x + ox
+    cur_pos[:, 1] = env_origins[:, 1] + oy  # drop the pick-env's y jitter; respawn with ours around origin
+    cur_pos[:, 2] = env_origins[:, 2] + BOX_START_Z
+    env_ids = torch.arange(n, dtype=torch.int32, device=device)
+    box.write_root_link_pose_to_sim(torch.cat([cur_pos, cur_quat], dim=-1), env_ids=env_ids)
+    box.write_root_link_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
 def _random_spawn_annulus(
     box_xy: torch.Tensor, r_min: float, r_max: float, seed: int, device: str,
     front_sector_half_width: Optional[float] = None,
@@ -266,6 +298,12 @@ def build_dataset(
     _ = env.get_observations()
     pick_idx_cache = _resolve_pick_indices(base_env)
 
+    # FSM-only override: re-position the box closer to the -x table edge so the walk-to-pick
+    # firing envelope leaves the robot a shorter reach. We re-teleport the box (keeping its
+    # training-time y jitter and yaw jitter) instead of changing policy_pick's constants,
+    # which would also shift the pick training distribution.
+    _override_box_spawn_fsm(base_env, box_x=0.45, jitter_x=0.02, jitter_y=0.05, seed=cfg.seed)
+
     box_xy = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
     spawn_xy, spawn_yaw = _random_spawn_annulus(box_xy, spawn_r_min, spawn_r_max, cfg.seed, device)
     spawn_z = torch.full((num_envs,), cfg.spawn_z, device=device)
@@ -278,22 +316,27 @@ def build_dataset(
         # num_envs==1 was already asserted above.
         spawn_np = spawn_xy[0].detach().cpu().numpy()
         box_np = box_xy[0].detach().cpu().numpy()
-        # Aim at the point on a circle of radius ``approach_r`` around the box that is closest
-        # to the spawn, so A* enters from the spawn side of the table rather than always
-        # detouring to the same snapped free cell behind it. approach_r stays under
-        # cfg.walk_to_pick_dist so the last waypoint sits inside the walk->pick handover
-        # envelope, letting the FSM fire naturally once the tracker exhausts the path.
-        approach_r = min(0.45, cfg.walk_to_pick_dist - 0.05)
-        dxy = spawn_np - box_np
-        d = float(np.linalg.norm(dxy))
-        if d < 1e-3:
-            approach_np = box_np + np.array([approach_r, 0.0], dtype=np.float32)
-        else:
-            approach_np = box_np + (dxy / d) * approach_r
-        # robot_r=0.15 uses the pelvis footprint (not the full arm-extended reach) so the
-        # planner can approach the tabletop close enough to hit the walk->pick handover
-        # envelope. Table half-extent (0.30) already provides margin.
-        astar_cfg = AstarConfig(arena_half=max(6.0, spawn_r_max + 1.0), robot_r=0.15)
+        # Approach side = the table edge with the shortest box-to-edge distance, so the robot
+        # ends up facing the box across the nearest edge (shortest reach), even when the long
+        # way around the table is required. Previous heuristic ("approach from the spawn side")
+        # stranded the robot on the far side when the box was tucked against the opposite edge.
+        cx_t, cy_t, hx_t, hy_t = PICK_TABLE_OBSTACLE
+        bx, by = float(box_np[0]), float(box_np[1])
+        edge_candidates = [
+            (bx - (cx_t - hx_t), np.array([-1.0, 0.0], dtype=np.float32)),  # -x edge
+            ((cx_t + hx_t) - bx, np.array([+1.0, 0.0], dtype=np.float32)),  # +x edge
+            (by - (cy_t - hy_t), np.array([0.0, -1.0], dtype=np.float32)),  # -y edge
+            ((cy_t + hy_t) - by, np.array([0.0, +1.0], dtype=np.float32)),  # +y edge
+        ]
+        _, outward = min(edge_candidates, key=lambda e: e[0])
+        approach_np = box_np + outward * float(cfg.walk_to_pick_dist)
+        # robot_r=0.30: pelvis footprint (~0.15) + gait side-step margin (~0.10) + 5 cm slack
+        # so the orbit path keeps the swinging legs clear of the table edge. Previously 0.15
+        # tracked the inflated obstacle tightly and ep103 orbited colliding its thigh with
+        # the table. The approach point (walk_to_pick_dist away from the box) stays outside
+        # this looser inflation on the -x edge; on the ±y edges it snaps a cell further out
+        # and _twist_along_astar's box-directed fallback closes the final gap.
+        astar_cfg = AstarConfig(arena_half=max(6.0, spawn_r_max + 1.0), robot_r=0.30)
         path = plan_path(spawn_np, approach_np, [PICK_TABLE_OBSTACLE], cfg=astar_cfg)
         if path is None or len(path) < 2:
             if verbose:
@@ -352,10 +395,18 @@ def build_dataset(
         upright = up_align > cfg.upright_min
         root_z = robot.data.root_link_pos_w[:, 2]
         box_z = box.data.root_link_pos_w[:, 2]
-        dist = torch.linalg.norm(
-            box.data.root_link_pos_w[:, :2] - robot.data.root_link_pos_w[:, :2], dim=-1,
-        )
+        dxy_to_box = box.data.root_link_pos_w[:, :2] - robot.data.root_link_pos_w[:, :2]
+        dist = torch.linalg.norm(dxy_to_box, dim=-1)
         base_vx = robot.data.root_link_lin_vel_b[:, 0].abs()
+        base_wz = robot.data.root_link_ang_vel_b[:, 2].abs()
+        # Heading error (rad) from robot forward to the box, wrapped to [-pi, pi]. Used to
+        # keep the robot rotating toward the box inside the brake region and to gate the
+        # pick fire on being pointed at the box (pick's training dist is always face-on).
+        r_quat = robot.data.root_link_quat_w
+        r_w, r_xq, r_yq, r_zq = r_quat.unbind(-1)
+        r_yaw = torch.atan2(2 * (r_w * r_zq + r_xq * r_yq), 1 - 2 * (r_yq * r_yq + r_zq * r_zq))
+        box_dir = torch.atan2(dxy_to_box[:, 1], dxy_to_box[:, 0])
+        heading_err = torch.atan2(torch.sin(box_dir - r_yaw), torch.cos(box_dir - r_yaw))
 
         fell_now = active & ((up_align < 0.25) | ((root_z < 0.15) & (up_align < 0.7)))
         if fell_now.any():
@@ -369,12 +420,23 @@ def build_dataset(
             twist = _twist_along_astar(base_env, astar_tracker, cfg.walk_speed_cap)
         else:
             twist = _twist_toward_box_batch(base_env, cfg.walk_speed_cap)
-        brake_mask = in_walk & (dist <= cfg.walk_to_pick_dist)
+        # Latch both the brake command and the counter once we enter the brake region: gait
+        # oscillation can push dist a few cm above walk_to_pick_dist for a handful of frames,
+        # and if we only latched the counter the twist would re-enable on every outward
+        # drift, re-accelerating the pelvis into the table and keeping base_vx above
+        # walk_to_pick_speed_max so the fire condition never triggered. Inside the brake we
+        # keep wz pointed at the box so the robot rotates in place to face the pick
+        # distribution (corner approaches used to fire off-axis).
+        entered_brake = in_walk & (dist <= cfg.walk_to_pick_dist)
+        brake_mask = in_walk & (entered_brake | (brake_counter > 0))
         if brake_mask.any():
-            twist = torch.where(brake_mask.unsqueeze(-1), torch.zeros_like(twist), twist)
-        # Latch the counter once we have entered the brake region: subsequent gait oscillation can push dist a few cm above walk_to_pick_dist and a strict consecutive-frames rule would reset the counter on every outward drift, so the handover never fired and episodes ran to max_steps (observed 10x slowdown). Reset only when the env leaves the walk phase (fire or fall).
+            yaw_wz = torch.clamp(1.5 * heading_err, -0.6, 0.6)
+            brake_twist = torch.stack(
+                [torch.zeros_like(yaw_wz), torch.zeros_like(yaw_wz), yaw_wz], dim=-1,
+            )
+            twist = torch.where(brake_mask.unsqueeze(-1), brake_twist, twist)
         brake_counter = torch.where(
-            in_walk & (brake_mask | (brake_counter > 0)),
+            brake_mask,
             brake_counter + 1,
             torch.zeros_like(brake_counter),
         )
@@ -404,6 +466,8 @@ def build_dataset(
             in_walk & upright
             & (dist <= cfg.walk_to_pick_dist)
             & (base_vx < cfg.walk_to_pick_speed_max)
+            & (base_wz < cfg.walk_to_pick_wz_max)
+            & (heading_err.abs() < cfg.walk_to_pick_heading_err_max)
             & (brake_counter >= cfg.walk_to_pick_brake_steps)
         )
         if fires.any():

@@ -39,6 +39,39 @@ DEFAULT_OUT = ROOT / "outputs" / "walk_pick_sequential.npz"
 DEFAULT_VIDEOS = ROOT / "outputs" / "media"
 
 
+def _run_episode_subprocess(
+    i: int, seed_i: int, tmp_npz: Path, video_path: Optional[Path],
+    device: str, max_steps: int, spawn_r_min: float, spawn_r_max: float,
+    use_astar: bool, fsm_root: Path,
+) -> tuple[int, int, int]:
+    """Launch a single ``fsm_continuous_batch`` subprocess (num_envs=1) and wait for it.
+    Args: i: episode index (for log tagging); seed_i: per-episode seed; tmp_npz: output .npz path (skipped if already exists for crash-recovery); video_path: optional mp4 output; device: torch device string; max_steps: per-episode step cap; spawn_r_min/spawn_r_max: annulus radii (m); use_astar: forward the --astar flag; fsm_root: repo root for the subprocess cwd.
+    Returns: (i, seed_i, returncode); returncode<0 means the npz was reused without re-running.
+    """
+    if tmp_npz.exists():
+        return i, seed_i, -1
+    cmd = [
+        sys.executable, "-m", "src.fsm_continuous_batch",
+        "--num-envs", "1", "--device", device,
+        "--out", str(tmp_npz), "--seed", str(seed_i),
+        "--max-steps", str(max_steps),
+        "--r-min", str(spawn_r_min), "--r-max", str(spawn_r_max),
+    ]
+    if video_path is not None:
+        cmd += ["--video-path", str(video_path)]
+    if use_astar:
+        cmd += ["--astar"]
+    r = subprocess.run(
+        cmd, cwd=str(fsm_root),
+        env={**os.environ, "MUJOCO_GL": "egl"},
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not tmp_npz.exists():
+        print(f"[seq] ep {i:03d} seed={seed_i}: subprocess FAILED (exit {r.returncode})")
+        print(r.stderr[-1500:] if r.stderr else "(no stderr)")
+    return i, seed_i, r.returncode
+
+
 def build_sequential_dataset(
     K: int,
     base_seed: int = 100,
@@ -50,11 +83,13 @@ def build_sequential_dataset(
     videos_dir: Optional[Path | str] = None,
     use_astar: bool = False,
     failed_dir: Optional[Path | str] = None,
+    workers: int = 1,
 ) -> dict:
     """Run K single-env episodes and concatenate into one .npz, optionally saving mp4 per episode.
-    Args: K: episode count; base_seed: first episode's seed; out_path: final concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min: inner annulus radius; spawn_r_max: outer annulus radius; videos_dir: if set, writes one mp4 per episode there; use_astar: forward --astar to each subprocess so the walk phase follows an A* path around the pick table; failed_dir: if set, per-episode .npz of fallen episodes is copied here (plus a metadata.json summarizing all episodes) so the caller can diagnose why the FSM chain fails.
+    Args: K: episode count; base_seed: first episode's seed; out_path: final concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min: inner annulus radius; spawn_r_max: outer annulus radius; videos_dir: if set, writes one mp4 per episode there; use_astar: forward --astar to each subprocess so the walk phase follows an A* path around the pick table; failed_dir: if set, per-episode .npz of fallen episodes is copied here (plus a metadata.json summarizing all episodes) so the caller can diagnose why the FSM chain fails; workers: parallel subprocess pool size (default 1 = original serial behavior; each subprocess still uses num_envs=1, so the mjwarp batch divergence that destabilised the walk-to-pick handover at num_envs>=2 is sidestepped by process isolation).
     Returns: dict with total_transitions, pick_successes, walk_kept, pick_kept, per_episode list.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     out_path = Path(out_path)
     if videos_dir is not None:
         videos_dir = Path(videos_dir)
@@ -63,52 +98,55 @@ def build_sequential_dataset(
         failed_dir = Path(failed_dir)
         failed_dir.mkdir(parents=True, exist_ok=True)
 
-    all_obs: list[np.ndarray] = []
-    all_act: list[np.ndarray] = []
-    all_phase: list[np.ndarray] = []
-    per_episode: list[dict] = []
     tmp_dir = Path("/tmp/fsm_seq")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     fsm_root = Path(__file__).resolve().parent.parent
 
+    def paths_for(i: int) -> tuple[int, Path, Optional[Path]]:
+        """Return (seed, tmp_npz, video_path) for episode index i."""
+        seed_i = base_seed + i
+        tmp_npz = tmp_dir / f"ep_{i:03d}_seed{seed_i}.npz"
+        video_path = videos_dir / f"seq_ep_{i:03d}_seed{seed_i}.mp4" if videos_dir is not None else None
+        return seed_i, tmp_npz, video_path
+
+    # Phase 1: launch subprocesses (serial if workers=1, parallel otherwise). Each writes
+    # its own tmp_npz; we only need the return codes to decide whether to process it.
+    workers = max(1, int(workers))
+    if workers == 1:
+        for i in range(K):
+            seed_i, tmp_npz, video_path = paths_for(i)
+            _run_episode_subprocess(
+                i, seed_i, tmp_npz, video_path, device, max_steps,
+                spawn_r_min, spawn_r_max, use_astar, fsm_root,
+            )
+    else:
+        print(f"[seq] running with {workers} parallel subprocess workers")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = []
+            for i in range(K):
+                seed_i, tmp_npz, video_path = paths_for(i)
+                futs.append(pool.submit(
+                    _run_episode_subprocess,
+                    i, seed_i, tmp_npz, video_path, device, max_steps,
+                    spawn_r_min, spawn_r_max, use_astar, fsm_root,
+                ))
+            for fut in as_completed(futs):
+                fut.result()  # surface any exception
+
+    # Phase 2: load each per-ep npz in index order and build per_episode summaries. Running
+    # this serially (even when workers>1) keeps the output deterministic and the npz reads
+    # cheap.
+    all_obs: list[np.ndarray] = []
+    all_act: list[np.ndarray] = []
+    all_phase: list[np.ndarray] = []
+    per_episode: list[dict] = []
     total_pick = 0
     dropped_fell = 0
     dropped_stuck = 0  # kept upright but never closed pick before max_steps; these frames were the majority of pre-filter data and were teaching the student to flail at the box
     for i in range(K):
-        seed_i = base_seed + i
-        tmp_npz = tmp_dir / f"ep_{i:03d}_seed{seed_i}.npz"
-        video_path = None
-        if videos_dir is not None:
-            video_path = videos_dir / f"seq_ep_{i:03d}_seed{seed_i}.mp4"
-
-        if tmp_npz.exists():
-            # Resume from a prior crashed run by reusing the existing per-episode dump.
-            pass
-        else:
-            cmd = [
-                sys.executable, "-m", "src.fsm_continuous_batch",
-                "--num-envs", "1",
-                "--device", device,
-                "--out", str(tmp_npz),
-                "--seed", str(seed_i),
-                "--max-steps", str(max_steps),
-                "--r-min", str(spawn_r_min),
-                "--r-max", str(spawn_r_max),
-            ]
-            if video_path is not None:
-                cmd += ["--video-path", str(video_path)]
-            if use_astar:
-                cmd += ["--astar"]
-            r = subprocess.run(
-                cmd, cwd=str(fsm_root),
-                env={**os.environ, "MUJOCO_GL": "egl"},
-                capture_output=True, text=True,
-            )
-            if r.returncode != 0 or not tmp_npz.exists():
-                print(f"[seq] ep {i:03d} seed={seed_i}: subprocess FAILED (exit {r.returncode})")
-                print(r.stderr[-1500:] if r.stderr else "(no stderr)")
-                continue
-
+        seed_i, tmp_npz, video_path = paths_for(i)
+        if not tmp_npz.exists():
+            continue  # subprocess failed; already logged
         blob = np.load(str(tmp_npz))
         obs_i = blob["unified_obs"]
         act_i = blob["action"]
@@ -250,6 +288,7 @@ def _main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--astar", action="store_true", help="Walk phase follows an A* path around the pick table.")
     ap.add_argument("--failed-dir", default=None, help="If set, per-episode .npz of fallen episodes is copied here plus a metadata.json for offline diagnosis.")
+    ap.add_argument("--workers", type=int, default=1, help="Parallel subprocess pool size. Each subprocess still runs num_envs=1 (process isolation sidesteps the mjwarp batch divergence that destabilises the walk-to-pick handover at num_envs>=2). Cap by VRAM / num_envs=1 memory footprint, roughly 350 MiB per worker on mjlab/mjwarp.")
     args = ap.parse_args()
 
     os.environ.setdefault("MUJOCO_GL", "egl")
@@ -264,6 +303,7 @@ def _main() -> None:
         videos_dir=args.videos_dir,
         use_astar=args.astar,
         failed_dir=args.failed_dir,
+        workers=args.workers,
     )
 
 
