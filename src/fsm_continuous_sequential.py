@@ -18,8 +18,8 @@ loop around episode 60.
 Input:  staged experts at ``experts/{walk,pick}.pt``.
 Output: ``outputs/walk_pick_sequential.npz`` (unified schema) + optional
         ``outputs/media/seq_ep_<ii>_seed<S>.mp4`` per episode. Per-episode
-        intermediate .npz files are kept under ``/tmp/fsm_seq/`` until the
-        final concatenation succeeds, so a crash mid-run can be recovered.
+        intermediate .npz files are kept under ``outputs/fsm_seq_cache/`` until
+        the final concatenation succeeds, so a crash mid-run can be recovered.
 """
 
 from __future__ import annotations
@@ -98,9 +98,12 @@ def build_sequential_dataset(
         failed_dir = Path(failed_dir)
         failed_dir.mkdir(parents=True, exist_ok=True)
 
-    tmp_dir = Path("/tmp/fsm_seq")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     fsm_root = Path(__file__).resolve().parent.parent
+    # Per-episode .npz cache under outputs/ (not /tmp) so partial progress survives reboots
+    # and tmpfs clears. Still wiped at the end of a successful concat; a crash leaves the
+    # cache so a re-run picks up where it stopped.
+    tmp_dir = fsm_root / "outputs" / "fsm_seq_cache"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     def paths_for(i: int) -> tuple[int, Path, Optional[Path]]:
         """Return (seed, tmp_npz, video_path) for episode index i."""
