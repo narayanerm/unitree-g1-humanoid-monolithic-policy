@@ -110,17 +110,28 @@ def build_sequential_dataset(
         return seed_i, tmp_npz, video_path
 
     # Phase 1: launch subprocesses (serial if workers=1, parallel otherwise). Each writes
-    # its own tmp_npz; we only need the return codes to decide whether to process it.
+    # its own tmp_npz; we only need the return codes to decide whether to process it. One
+    # progress line per completed subprocess so a long run (K=2000) is not silent.
     workers = max(1, int(workers))
+
+    def _print_progress(k_done: int, i: int, seed_i: int, rc: int) -> None:
+        """Live progress print: episode just finished (rc<0 means we reused a cached npz).
+        Args: k_done: how many episodes have completed so far (1-indexed); i: episode index; seed_i: episode seed; rc: subprocess returncode (<0 = reused existing tmp_npz).
+        Returns: none.
+        """
+        status = "reused" if rc < 0 else ("done" if rc == 0 else f"FAILED rc={rc}")
+        print(f"[seq] {k_done:>4d}/{K:<4d} ep {i:03d} seed={seed_i}: {status}", flush=True)
+
     if workers == 1:
         for i in range(K):
             seed_i, tmp_npz, video_path = paths_for(i)
-            _run_episode_subprocess(
+            _, _, rc = _run_episode_subprocess(
                 i, seed_i, tmp_npz, video_path, device, max_steps,
                 spawn_r_min, spawn_r_max, use_astar, fsm_root,
             )
+            _print_progress(i + 1, i, seed_i, rc)
     else:
-        print(f"[seq] running with {workers} parallel subprocess workers")
+        print(f"[seq] running with {workers} parallel subprocess workers", flush=True)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = []
             for i in range(K):
@@ -130,8 +141,11 @@ def build_sequential_dataset(
                     i, seed_i, tmp_npz, video_path, device, max_steps,
                     spawn_r_min, spawn_r_max, use_astar, fsm_root,
                 ))
+            k_done = 0
             for fut in as_completed(futs):
-                fut.result()  # surface any exception
+                i_done, seed_done, rc = fut.result()  # surfaces any exception too
+                k_done += 1
+                _print_progress(k_done, i_done, seed_done, rc)
 
     # Phase 2: load each per-ep npz in index order and build per_episode summaries. Running
     # this serially (even when workers>1) keeps the output deterministic and the npz reads
