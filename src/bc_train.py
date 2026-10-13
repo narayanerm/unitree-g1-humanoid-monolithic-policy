@@ -30,6 +30,17 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_ROOT = ROOT / "outputs" / "logs" / "g1_monolithic"
 
 
+def _fmt_hms(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS for the ETA log line.
+    Args: seconds: non-negative duration.
+    Returns: zero-padded HH:MM:SS string.
+    """
+    s = max(0, int(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 @dataclass
 class BCConfig:
     """Hyperparameters for the BC loop; the notebook edits fields by name."""
@@ -127,7 +138,10 @@ def train_bc(
 
     best_val = float("inf")
     global_step = 0
+    t_start = time.time()
+    ewma_epoch_s: Optional[float] = None
     for epoch in range(cfg.epochs):
+        t_epoch_start = time.time()
         student.train()
         running = 0.0
         seen = 0
@@ -153,10 +167,21 @@ def train_bc(
                 v_seen += x.shape[0]
             val_loss = v_run / max(1, v_seen)
 
+        epoch_s = time.time() - t_epoch_start
+        ewma_epoch_s = epoch_s if ewma_epoch_s is None else 0.9 * ewma_epoch_s + 0.1 * epoch_s
+        elapsed_s = time.time() - t_start
+        eta_s = (cfg.epochs - epoch - 1) * ewma_epoch_s
+
         writer.add_scalar("BC/train_loss", train_loss, epoch)
         writer.add_scalar("BC/val_loss", val_loss, epoch)
+        writer.add_scalar("Perf/epoch_s", epoch_s, epoch)
+        writer.add_scalar("Perf/elapsed_s", elapsed_s, epoch)
+        writer.add_scalar("Perf/eta_s", eta_s, epoch)
         if (epoch % cfg.log_every) == 0 or epoch == cfg.epochs - 1:
-            print(f"  epoch {epoch:4d} | train {train_loss:.5f} | val {val_loss:.5f}")
+            print(
+                f"  epoch {epoch:4d}/{cfg.epochs} | train {train_loss:.5f} | val {val_loss:.5f} "
+                f"| epoch_s={epoch_s:.1f} elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}"
+            )
 
         if val_loss < best_val:
             best_val = val_loss

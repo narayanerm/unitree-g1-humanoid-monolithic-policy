@@ -56,6 +56,17 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_ROOT = ROOT / "outputs" / "logs" / "g1_monolithic_ppo"
 
 
+def _fmt_hms(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS for the ETA log line.
+    Args: seconds: non-negative duration.
+    Returns: zero-padded HH:MM:SS string.
+    """
+    s = max(0, int(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 @dataclass
 class PPOFinetuneConfig:
     """Hyperparameters for the BeyondMimic-style PPO fine-tune."""
@@ -399,7 +410,10 @@ def ppo_finetune(
     prev_dist = _distance_to_box(base_env)
 
     reset_counter = 1
+    t_start = time.time()
+    ewma_iter_s: Optional[float] = None
     for it in range(start_iter, cfg.max_iterations):
+        t_iter_start = time.time()
         if it == cfg.freeze_log_std_iters:
             actor.log_std.requires_grad_(True)
             print(f"[ppo] iter {it}: unfroze log_std (initial exp(log_std)={actor.log_std.exp().mean().item():.3f})")
@@ -547,6 +561,13 @@ def ppo_finetune(
         for g in optim.param_groups:
             g["lr"] = lr
 
+        # Time accounting: EWMA of iter wall time, used to project ETA.
+        iter_s = time.time() - t_iter_start
+        ewma_iter_s = iter_s if ewma_iter_s is None else 0.9 * ewma_iter_s + 0.1 * iter_s
+        elapsed_s = time.time() - t_start
+        remaining_iters = cfg.max_iterations - it - 1
+        eta_s = remaining_iters * ewma_iter_s
+
         # Logging.
         mean_step_rew = rew_buf.mean().item()
         writer.add_scalar("Train/mean_reward_total", mean_step_rew, it)
@@ -562,13 +583,17 @@ def ppo_finetune(
         writer.add_scalar("Loss/kl_to_prior", kl_prior_sum / n_updates, it)
         writer.add_scalar("Loss/approx_kl", mean_kl, it)
         writer.add_scalar("Policy/mean_std", actor.log_std.exp().mean().item(), it)
+        writer.add_scalar("Perf/iter_s", iter_s, it)
+        writer.add_scalar("Perf/elapsed_s", elapsed_s, it)
+        writer.add_scalar("Perf/eta_s", eta_s, it)
 
         if (it % cfg.log_interval) == 0:
             print(
-                f"[ppo] iter {it:4d} | r_total={mean_step_rew:+.3f} "
+                f"[ppo] iter {it:4d}/{cfg.max_iterations} | r_total={mean_step_rew:+.3f} "
                 f"r_env={iter_env_rew / T:+.3f} r_mim={iter_mimic_rew / T:+.3f} "
                 f"r_shp={iter_shape_rew / T:+.3f} | fires={iter_pick_fires} falls={iter_falls} "
-                f"| kl={mean_kl:.4f} std={actor.log_std.exp().mean().item():.3f} lr={lr:.1e}"
+                f"| kl={mean_kl:.4f} std={actor.log_std.exp().mean().item():.3f} lr={lr:.1e} "
+                f"| iter_s={iter_s:.1f} elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}"
             )
 
         if (it % cfg.save_interval) == 0 or it == cfg.max_iterations - 1:
