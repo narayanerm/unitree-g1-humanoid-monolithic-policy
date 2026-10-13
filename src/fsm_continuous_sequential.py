@@ -1,25 +1,9 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
-##########################################################################################
-"""Sequential wrapper around ``fsm_continuous_batch.build_dataset``: runs K
-independent episodes with num_envs=1 each (one Python subprocess per episode
-to prevent mjlab/warp context memory accumulating across runs), then
-concatenates the per-episode .npz into one unified dataset. Optionally saves
-an mp4 per episode.
+"""Sequential wrapper around ``fsm_continuous_batch.build_dataset``: runs K independent episodes with num_envs=1 each (one Python subprocess per episode to keep mjlab/warp context memory from accumulating across runs), then concatenates the per-episode .npz into one unified dataset. Optionally saves an mp4 per episode.
 
-Purpose: works around a batch (num_envs>=2) failure of the walk-to-pick handover
-we couldn't isolate (mjlab/mjwarp physics diverges subtly between batch=1 and
-batch>=2). Sequential N=1 keeps success rate around 78 to 100% per episode.
-Subprocess isolation avoids the ~150 MB/episode leak that OOMs a monolithic
-loop around episode 60.
+Purpose: works around a batch (num_envs>=2) failure of the walk-to-pick handover we could not isolate (mjlab/mjwarp physics diverges subtly between batch=1 and batch>=2). Sequential N=1 keeps success rate around 78 to 100% per episode. Subprocess isolation avoids the ~150 MB/episode leak that OOMs a monolithic loop around episode 60.
 
 Input:  staged experts at ``experts/{walk,pick}.pt``.
-Output: ``outputs/walk_pick_sequential.npz`` (unified schema) + optional
-        ``outputs/media/seq_ep_<ii>_seed<S>.mp4`` per episode. Per-episode
-        intermediate .npz files are kept under ``outputs/fsm_seq_cache/`` until
-        the final concatenation succeeds, so a crash mid-run can be recovered.
+Output: ``outputs/walk_pick_sequential.npz`` (unified schema) plus optional ``outputs/media/seq_ep_<ii>_seed<S>.mp4`` per episode. Per-episode intermediate .npz files are kept under ``outputs/fsm_seq_cache/`` until the final concatenation succeeds, so a crash mid-run can be recovered.
 """
 
 from __future__ import annotations
@@ -99,27 +83,26 @@ def build_sequential_dataset(
         failed_dir.mkdir(parents=True, exist_ok=True)
 
     fsm_root = Path(__file__).resolve().parent.parent
-    # Per-episode .npz cache under outputs/ (not /tmp) so partial progress survives reboots
-    # and tmpfs clears. Still wiped at the end of a successful concat; a crash leaves the
-    # cache so a re-run picks up where it stopped.
+    # Per-episode .npz cache under outputs/ (not /tmp) so partial progress survives reboots and tmpfs clears; wiped on successful concat, left behind on crash so a re-run resumes.
     tmp_dir = fsm_root / "outputs" / "fsm_seq_cache"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     def paths_for(i: int) -> tuple[int, Path, Optional[Path]]:
-        """Return (seed, tmp_npz, video_path) for episode index i."""
+        """Resolve per-episode seed, cache path, and optional video path for episode index i.
+        Args: i: episode index.
+        Returns: tuple (seed, tmp_npz, video_path); video_path is None when videos_dir is unset.
+        """
         seed_i = base_seed + i
         tmp_npz = tmp_dir / f"ep_{i:03d}_seed{seed_i}.npz"
         video_path = videos_dir / f"seq_ep_{i:03d}_seed{seed_i}.mp4" if videos_dir is not None else None
         return seed_i, tmp_npz, video_path
 
-    # Phase 1: launch subprocesses (serial if workers=1, parallel otherwise). Each writes
-    # its own tmp_npz; we only need the return codes to decide whether to process it. One
-    # progress line per completed subprocess so a long run (K=2000) is not silent.
+    # Phase 1: launch subprocesses (serial if workers=1, parallel otherwise), one progress line per completed subprocess so a long run (K=2000) is not silent.
     workers = max(1, int(workers))
 
-    def _print_progress(k_done: int, i: int, seed_i: int, rc: int) -> None:
-        """Live progress print: episode just finished (rc<0 means we reused a cached npz).
-        Args: k_done: how many episodes have completed so far (1-indexed); i: episode index; seed_i: episode seed; rc: subprocess returncode (<0 = reused existing tmp_npz).
+    def print_progress(k_done: int, i: int, seed_i: int, rc: int) -> None:
+        """Emit a live progress line for the episode that just finished.
+        Args: k_done: how many episodes have completed so far (1-indexed); i: episode index; seed_i: episode seed; rc: subprocess returncode (negative means reused existing tmp_npz).
         Returns: none.
         """
         status = "reused" if rc < 0 else ("done" if rc == 0 else f"FAILED rc={rc}")
@@ -132,7 +115,7 @@ def build_sequential_dataset(
                 i, seed_i, tmp_npz, video_path, device, max_steps,
                 spawn_r_min, spawn_r_max, use_astar, fsm_root,
             )
-            _print_progress(i + 1, i, seed_i, rc)
+            print_progress(i + 1, i, seed_i, rc)
     else:
         print(f"[seq] running with {workers} parallel subprocess workers", flush=True)
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -148,18 +131,16 @@ def build_sequential_dataset(
             for fut in as_completed(futs):
                 i_done, seed_done, rc = fut.result()  # surfaces any exception too
                 k_done += 1
-                _print_progress(k_done, i_done, seed_done, rc)
+                print_progress(k_done, i_done, seed_done, rc)
 
-    # Phase 2: load each per-ep npz in index order and build per_episode summaries. Running
-    # this serially (even when workers>1) keeps the output deterministic and the npz reads
-    # cheap.
+    # Phase 2: load each per-ep npz in index order to keep output deterministic and npz reads cheap, even when workers>1.
     all_obs: list[np.ndarray] = []
     all_act: list[np.ndarray] = []
     all_phase: list[np.ndarray] = []
     per_episode: list[dict] = []
     total_pick = 0
     dropped_fell = 0
-    dropped_stuck = 0  # kept upright but never closed pick before max_steps; these frames were the majority of pre-filter data and were teaching the student to flail at the box
+    dropped_stuck = 0  # upright but never closed pick before max_steps; filtering these out stops the student from being trained on failed box approaches.
     for i in range(K):
         seed_i, tmp_npz, video_path = paths_for(i)
         if not tmp_npz.exists():

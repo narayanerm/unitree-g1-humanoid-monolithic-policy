@@ -30,10 +30,7 @@ from typing import Optional
 import numpy as np
 
 
-# Pick-table footprint in world frame; matches ``policy_pick.TABLE_X`` (0.60 m)
-# and a conservative half-extent that keeps the inflated obstacle away from
-# the tabletop grip region. Kept here so ``fsm_continuous_batch`` imports one
-# canonical constant instead of hard-coding another copy.
+# Pick-table footprint (cx, cy, hx, hy) in world frame, matching ``policy_pick.TABLE_X`` (0.60 m); exported so ``fsm_continuous_batch`` imports one canonical constant.
 PICK_TABLE_OBSTACLE = (0.60, 0.0, 0.30, 0.40)
 
 
@@ -65,21 +62,30 @@ def _build_occupancy(cfg: AstarConfig, obstacles: list[tuple[float, float, float
 
 
 def _world_to_cell(xy, cfg: AstarConfig) -> tuple[int, int]:
-    """Map world xy to grid indices (i, j) with (0, 0) at (-arena_half, -arena_half)."""
+    """Map world xy to grid indices with origin at the arena corner.
+    Args: xy: (x, y) world coordinates; cfg: grid config supplying ``arena_half`` and ``res``.
+    Returns: (i, j) integer cell indices with (0, 0) at (-arena_half, -arena_half).
+    """
     i = int(round((float(xy[0]) + cfg.arena_half) / cfg.res))
     j = int(round((float(xy[1]) + cfg.arena_half) / cfg.res))
     return i, j
 
 
 def _cell_to_world(ij: tuple[int, int], cfg: AstarConfig) -> tuple[float, float]:
-    """Map grid indices back to world xy at cell centre."""
+    """Map grid indices back to world xy at the cell centre.
+    Args: ij: (i, j) integer cell indices; cfg: grid config supplying ``arena_half`` and ``res``.
+    Returns: (x, y) world coordinates of the cell centre.
+    """
     x = -cfg.arena_half + ij[0] * cfg.res
     y = -cfg.arena_half + ij[1] * cfg.res
     return x, y
 
 
 def _snap_to_free(cell: tuple[int, int], occ: np.ndarray) -> Optional[tuple[int, int]]:
-    """BFS-snap ``cell`` to the nearest free grid cell (4-connected)."""
+    """BFS-snap a grid cell to the nearest free cell under 4-connected moves.
+    Args: cell: (i, j) starting cell; occ: (n, n) bool grid where True marks blocked cells.
+    Returns: (i, j) of the nearest free cell, or None if ``cell`` is out of bounds.
+    """
     n0, n1 = occ.shape
     if not (0 <= cell[0] < n0 and 0 <= cell[1] < n1):
         return None
@@ -106,7 +112,10 @@ _NEIGHBOURS = (
 
 
 def _astar(occ: np.ndarray, s: tuple[int, int], t: tuple[int, int]) -> Optional[list[tuple[int, int]]]:
-    """8-connected A* with octile heuristic; returns list of cells from ``s`` to ``t`` or None."""
+    """Run 8-connected A* with the octile heuristic over an occupancy grid.
+    Args: occ: (n, n) bool grid, True where blocked; s: start cell (i, j); t: goal cell (i, j).
+    Returns: list of cells from ``s`` to ``t`` inclusive, or None if ``t`` is unreachable.
+    """
     n0, n1 = occ.shape
 
     def h(c):

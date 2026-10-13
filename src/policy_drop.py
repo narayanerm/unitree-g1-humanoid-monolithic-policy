@@ -418,9 +418,9 @@ def reset_from_carry_buffer(
     place_bias: float = 0.0,
     target_scale: float = 1.0,
 ) -> None:
-    """Lerp robot and box between the PLACED endpoint (bb=1) and a carry-buffer sample (bb=0).
+    """Lerp robot and box between the PLACED endpoint (bb=1) and a carry-buffer sample (bb=0), stashing the sampled placed_box pose in env.extras so reset_drop_command_and_object locks the place-target onto the same pose.
     Args: env: RL env; env_ids: envs to reset (None = all); buffer_path: carry-terminal-states .npz path; xy_range / yaw_range: additive jitter scaled by (1-bb); asset_cfg: robot entity covering all 29 G1 joints in G1_JOINTS order; box_cfg: box entity; place_bias: curriculum weight in [0, 1]; target_scale: placed-box jitter multiplier, pinned to 1.0.
-    Returns: none. Stashes the sampled placed_box pose in env.extras so reset_drop_command_and_object locks the place-target onto the same pose (bb=1 harvests hand_release / box_flat_at_target from step 0).
+    Returns: none.
     """
     from mjlab.utils.lab_api.math import (
         quat_apply, quat_from_euler_xyz, quat_mul, sample_uniform,
@@ -1003,7 +1003,7 @@ def palm_inward_bilateral_reward(env, left_hand_cfg, right_hand_cfg,
                                   left_target_axis_body=(0.0, -1.0, 0.0),
                                   right_target_axis_body=(0.0,  1.0, 0.0),
                                   w_left: float = 0.5, w_right: float = 0.5):
-    """Fused palm-inward alignment for both hands. Weighted sum of per-hand rewards.
+    """Weighted sum of per-hand palm-inward alignment rewards.
     Args: env: RL env; left/right_hand_cfg: hand entities; per-side palm/target axes; w_left/w_right: per-side weights folded in.
     Returns: (num_envs,) tensor.
     """

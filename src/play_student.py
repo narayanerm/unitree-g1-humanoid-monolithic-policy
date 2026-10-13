@@ -1,18 +1,13 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/humanoid-loco-manipulation                   #
-##########################################################################################
 """Closed-loop rollout of the monolithic student in the pick scene.
 
 Loads a ``MonolithicPolicyStudent`` checkpoint, rolls it out for N episodes with
 different spawns and goals, prints a pass/fail table, and writes an mp4 of the
 first episode with a tracking camera on the robot.
 
-The FSM phase fed to the student mirrors ``fsm_continuous_batch``:
-``phase=walk`` while far from the box, flips to ``phase=pick`` once the walk
-brake predicate fires (close + slow + upright). No expert weights are used: the
-student's own action closes the loop.
+The FSM phase fed to the student mirrors ``fsm_continuous_batch``: ``phase=walk``
+while far from the box, flips to ``phase=pick`` once the walk brake predicate
+fires (close, slow, upright). No expert weights are used; the student's own
+action closes the loop.
 """
 
 from __future__ import annotations
@@ -87,7 +82,7 @@ def _rollout_episode(
     torch.cuda.manual_seed_all(int(seed))
     np.random.seed(int(seed))
 
-    base_env.reset()  # restore joints to default and rerandomise box; without this the fallen pose of the previous episode leaks into the next spawn
+    base_env.reset()  # restore default joints and rerandomise box so the previous episode's fallen pose does not leak into the next spawn
 
     goal = sample_goal(1, device=device, seed=seed)
 
@@ -127,7 +122,7 @@ def _rollout_episode(
         upright = up_align > cfg.upright_min
         in_walk = int(phase_ids[0]) == WALK_PHASE_ID
         in_brake = in_walk and dist <= cfg.walk_to_pick_dist
-        # Latch: once we have entered the brake region, keep counting while still in walk; gait oscillation can push dist a few cm above the boundary and a strict consecutive-frames rule would reset the count.
+        # Latch the brake counter while still in walk so gait oscillation around the boundary cannot reset it.
         if in_walk and (in_brake or brake_counter > 0):
             brake_counter += 1
         else:

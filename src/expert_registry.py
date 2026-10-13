@@ -1,8 +1,3 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
-##########################################################################################
 """Registry of the four expert policies driven by the FSM controller."""
 
 from __future__ import annotations

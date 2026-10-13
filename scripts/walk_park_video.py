@@ -2,14 +2,9 @@
 # Project    : unitree-g1-humanoid-monolithic-policy                                     #
 # Developer  : Narayane Ribeiro Medeiros                                                 #
 ##########################################################################################
-"""Record a short mp4 of walk.pt: first ``--walk-steps`` forward at ``--walk-vx``,
-then zero twist for ``--stop-steps``, so we can see how fast the policy brakes to
-a stand after real locomotion momentum (vs the trivial zero-from-rest case).
-
-Run:
-    MUJOCO_GL=egl python3.10 scripts/walk_park_video.py \
-        --ckpt experts/walk.pt --out outputs/media/walk_park.mp4 \
-        --walk-steps 120 --stop-steps 200 --walk-vx 0.6
+"""Record an mp4 of walk.pt: forward twist for `--walk-steps`, then zero twist for `--stop-steps`.
+Shows how quickly the policy brakes to a stand after locomotion momentum.
+Run: `MUJOCO_GL=egl python3.10 scripts/walk_park_video.py --ckpt experts/walk.pt --out outputs/media/walk_park.mp4 --walk-steps 120 --stop-steps 200 --walk-vx 0.6`.
 """
 
 from __future__ import annotations
@@ -30,6 +25,10 @@ from src.policy_walk import TASK_ID as WALK_TASK_ID, register as register_walk
 
 
 def main() -> None:
+    """Parse CLI args, roll out walk-then-park, write mp4 and print drift stats.
+    Args: none (reads argparse from sys.argv).
+    Returns: None.
+    """
     ap = argparse.ArgumentParser(description="Walk-then-park rollout: forward twist for N steps, then zero.")
     ap.add_argument("--ckpt", default="experts/walk.pt")
     ap.add_argument("--out", default="outputs/media/walk_park.mp4")

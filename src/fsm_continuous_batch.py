@@ -3,20 +3,7 @@
 # Developer  : Narayane Ribeiro Medeiros                                                 #
 # Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
-"""Batched adaptation of ``fsm_continuous.py`` for BC dataset generation.
-
-Direct fork of ``fsm_continuous.rollout``, same setup (pick env + table2,
-seed=7 defaults, thresholds, snap helpers), but with ``num_envs=N`` and per-env
-FSM state so many episodes accumulate in parallel. Only walk-to-pick is kept;
-carry/drop/walk_return are dropped since we only distill that segment. Records
-``(unified_obs, action, phase)`` per active env per sim step and writes a .npz
-matching the schema consumed by ``src.bc_train`` (unified student).
-
-Everything single-env in the fork parent is either kept verbatim (transition
-predicates, brake logic, ``_snap_pick_commands_to_robot``'s batched form) or
-replaced with a per-env vectorised variant (teleport, velocity zero, one-hot
-phase).
-"""
+"""Batched walk-to-pick FSM rollout that writes a BC dataset for the unified student."""
 
 from __future__ import annotations
 
@@ -55,7 +42,7 @@ PICK_PHASE_ID = 1
 
 @dataclass
 class BatchStats:
-    """Rollout counters returned by ``build_dataset`` for post-hoc reporting."""
+    """Rollout counters returned by build_dataset for post-hoc reporting."""
     total_transitions: int
     per_phase_kept: dict[str, int]
     walk_to_pick_fires: int
@@ -90,12 +77,9 @@ def _override_box_spawn_fsm(
     jitter_y: float,
     seed: int,
 ) -> None:
-    """Teleport the box to a tighter spawn (``box_x`` +/- ``jitter_x`` on x, box's own y +/- ``jitter_y``).
-    Args: base_env: mjlab env; box_x: nominal world-x of the box center (closer to the -x table edge); jitter_x/jitter_y: half-ranges (m) for uniform noise; seed: RNG seed per episode.
+    """Teleport the box to a tighter spawn around (box_x, 0) with uniform jitter.
+    Args: base_env: mjlab env; box_x: nominal world-x of the box center; jitter_x: half-range (m) on x; jitter_y: half-range (m) on y; seed: RNG seed per episode.
     Returns: none.
-    FSM-only re-position so policy_pick's training config (BOX_START_X, OBJECT_XY_JITTER_X)
-    stays untouched. Keeps the box's current z and quaternion (the pick env reset already
-    placed it on the tabletop with its own yaw jitter).
     """
     from src.policy_pick import BOX_START_Z
     box = base_env.scene["box"]
@@ -108,7 +92,7 @@ def _override_box_spawn_fsm(
     oy = (2.0 * torch.rand(n, device=device, generator=g) - 1.0) * jitter_y
     env_origins = base_env.scene.env_origins
     cur_pos[:, 0] = env_origins[:, 0] + box_x + ox
-    cur_pos[:, 1] = env_origins[:, 1] + oy  # drop the pick-env's y jitter; respawn with ours around origin
+    cur_pos[:, 1] = env_origins[:, 1] + oy  # respawn with our own y jitter around the env origin
     cur_pos[:, 2] = env_origins[:, 2] + BOX_START_Z
     env_ids = torch.arange(n, dtype=torch.int32, device=device)
     box.write_root_link_pose_to_sim(torch.cat([cur_pos, cur_quat], dim=-1), env_ids=env_ids)
@@ -123,7 +107,7 @@ def _random_spawn_annulus(
     Args: box_xy: (N, 2) world box positions; r_min: inner radius (m); r_max: outer radius (m); seed: RNG seed; device: torch device; front_sector_half_width: ignored, kept for backward-compat.
     Returns: (spawn_xy (N, 2), spawn_yaw (N,) uniform in [-pi, pi)).
     """
-    del front_sector_half_width  # kept in signature so older callers don't break
+    del front_sector_half_width  # kept in signature for backward-compat
     n = box_xy.shape[0]
     g = torch.Generator(device=device).manual_seed(int(seed))
     alpha = 2.0 * torch.pi * torch.rand(n, device=device, generator=g)
@@ -138,7 +122,7 @@ def _random_spawn_annulus(
 
 def _twist_toward_box_batch(base_env, walk_speed_cap: float) -> torch.Tensor:
     """Build the walk-expert twist command that steers each env toward its own box.
-    Args: base_env: mjlab env; walk_speed_cap: max forward speed (m/s) forwarded to ``_twist_toward``.
+    Args: base_env: mjlab env; walk_speed_cap: max forward speed (m/s) forwarded to _twist_toward.
     Returns: (N, 3) twist tensor consumable by the walk expert.
     """
     box_xy = base_env.scene["box"].data.root_link_pos_w[:, :2]
@@ -147,13 +131,8 @@ def _twist_toward_box_batch(base_env, walk_speed_cap: float) -> torch.Tensor:
 
 def _twist_along_astar(base_env, tracker: WaypointTracker, walk_speed_cap: float) -> torch.Tensor:
     """Build the walk-expert twist along the A* path, switching to reactive pursuit at the end.
-    Args: base_env: mjlab env with num_envs==1; tracker: per-episode ``WaypointTracker`` over
-    the A* path; walk_speed_cap: max forward speed (m/s) forwarded to ``_twist_toward``.
+    Args: base_env: mjlab env with num_envs==1; tracker: per-episode WaypointTracker over the A* path; walk_speed_cap: max forward speed (m/s) forwarded to _twist_toward.
     Returns: (1, 3) twist tensor consumable by the walk expert.
-    Once the tracker is on its last waypoint and the robot is inside the arrival radius of it,
-    steering falls back to the box directly so the last ~10 cm close the walk->pick handover
-    envelope (the tracker's pure-pursuit toward the final waypoint is asymptotic and would
-    otherwise orbit at a fixed radius).
     """
     robot = base_env.scene["robot"]
     device = robot.data.root_link_pos_w.device
@@ -170,7 +149,7 @@ def _twist_along_astar(base_env, tracker: WaypointTracker, walk_speed_cap: float
 
 def _snap_pick_commands_batched(base_env, env_ids: Optional[torch.Tensor] = None) -> None:
     """Anchor pick-expert command extras per env, fixing the yaw[0] broadcast of the single-env path.
-    Args: base_env: mjlab env; env_ids: optional (K,) subset to update (avoids re-anchoring envs already past handover).
+    Args: base_env: mjlab env; env_ids: optional (K,) subset to update, skipping envs past handover.
     Returns: none.
     """
     from src.policy_pick import (
@@ -210,9 +189,9 @@ def _snap_pick_commands_batched(base_env, env_ids: Optional[torch.Tensor] = None
 
 
 def _phase_one_hot(phase_ids: torch.Tensor) -> torch.Tensor:
-    """Encode per-env FSM phase ids as one-hot rows of width ``PHASE_ONE_HOT_DIM``.
+    """Encode per-env FSM phase ids as one-hot rows of width PHASE_ONE_HOT_DIM.
     Args: phase_ids: (N,) integer phase index per env.
-    Returns: (N, PHASE_ONE_HOT_DIM) float tensor on ``phase_ids.device``.
+    Returns: (N, PHASE_ONE_HOT_DIM) float tensor on phase_ids.device.
     """
     oh = torch.zeros(phase_ids.shape[0], PHASE_ONE_HOT_DIM, device=phase_ids.device)
     oh.scatter_(1, phase_ids.long().unsqueeze(-1), 1.0)
@@ -255,8 +234,8 @@ def build_dataset(
     use_astar: bool = False,
 ) -> BatchStats:
     """Roll a batched walk-to-pick FSM and record (unified_obs, action, phase) transitions to disk.
-    Args: num_envs: parallel envs; device: torch device; out_path: .npz destination; seed: RNG seed; max_steps: sim step budget; spawn_r_min/spawn_r_max: annulus radii (m) around each table; cfg: optional override for ``RolloutConfig``; verbose: periodic progress prints; video_path: optional mp4 output; video_fps: mp4 framerate; video_hw: (height, width) frame size; use_astar: if True, walk phase follows an 8-connected A* path around the pick table (requires num_envs==1); if False, walk phase uses reactive pure-pursuit straight at the box.
-    Returns: ``BatchStats`` with transition counts, handover fires, pick successes, and fall count.
+    Args: num_envs: parallel envs; device: torch device; out_path: .npz destination; seed: RNG seed; max_steps: sim step budget; spawn_r_min: inner annulus radius (m); spawn_r_max: outer annulus radius (m); cfg: optional RolloutConfig override; verbose: periodic progress prints; video_path: optional mp4 output; video_fps: mp4 framerate; video_hw: (height, width) frame size; use_astar: if True, walk follows an 8-connected A* path (requires num_envs==1), otherwise reactive pure-pursuit.
+    Returns: BatchStats with transition counts, handover fires, pick successes, and fall count.
     """
     if use_astar and num_envs != 1:
         raise ValueError(f"use_astar requires num_envs==1, got {num_envs}")
@@ -269,7 +248,7 @@ def build_dataset(
 
     if cfg is None:
         cfg = RolloutConfig(seed=seed, max_steps=max_steps)
-        # Widen brake envelope to 0.55 m so the swing foot clears the table front edge (box sits ~9 cm behind it) while still landing inside pick's grip reach.
+        # Widen brake envelope so the swing foot clears the table edge but still lands in pick's grip reach.
         cfg.walk_to_pick_dist = 0.55
 
     torch.manual_seed(int(cfg.seed))
@@ -298,28 +277,21 @@ def build_dataset(
     _ = env.get_observations()
     pick_idx_cache = _resolve_pick_indices(base_env)
 
-    # FSM-only override: re-position the box closer to the -x table edge so the walk-to-pick
-    # firing envelope leaves the robot a shorter reach. We re-teleport the box (keeping its
-    # training-time y jitter and yaw jitter) instead of changing policy_pick's constants,
-    # which would also shift the pick training distribution.
+    # Re-position the box closer to the -x table edge without touching policy_pick's training constants.
     _override_box_spawn_fsm(base_env, box_x=0.45, jitter_x=0.02, jitter_y=0.05, seed=cfg.seed)
 
     box_xy = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
     spawn_xy, spawn_yaw = _random_spawn_annulus(box_xy, spawn_r_min, spawn_r_max, cfg.seed, device)
     spawn_z = torch.full((num_envs,), cfg.spawn_z, device=device)
     _teleport_robot_batch(base_env, spawn_xy, spawn_z, spawn_yaw)
-    # Flush the teleport with one zero-action step; robot.data.* only reflects queued pose writes after a sim step.
+    # Flush the teleport: robot.data.* only reflects queued pose writes after a sim step.
     env.step(torch.zeros(num_envs, UNIFIED_ACT_DIM, device=device))
 
     astar_tracker: Optional[WaypointTracker] = None
     if use_astar:
-        # num_envs==1 was already asserted above.
         spawn_np = spawn_xy[0].detach().cpu().numpy()
         box_np = box_xy[0].detach().cpu().numpy()
-        # Approach side = the table edge with the shortest box-to-edge distance, so the robot
-        # ends up facing the box across the nearest edge (shortest reach), even when the long
-        # way around the table is required. Previous heuristic ("approach from the spawn side")
-        # stranded the robot on the far side when the box was tucked against the opposite edge.
+        # Pick the table edge nearest the box so the final approach crosses the shortest reach.
         cx_t, cy_t, hx_t, hy_t = PICK_TABLE_OBSTACLE
         bx, by = float(box_np[0]), float(box_np[1])
         edge_candidates = [
@@ -330,12 +302,7 @@ def build_dataset(
         ]
         _, outward = min(edge_candidates, key=lambda e: e[0])
         approach_np = box_np + outward * float(cfg.walk_to_pick_dist)
-        # robot_r=0.30: pelvis footprint (~0.15) + gait side-step margin (~0.10) + 5 cm slack
-        # so the orbit path keeps the swinging legs clear of the table edge. Previously 0.15
-        # tracked the inflated obstacle tightly and ep103 orbited colliding its thigh with
-        # the table. The approach point (walk_to_pick_dist away from the box) stays outside
-        # this looser inflation on the -x edge; on the ±y edges it snaps a cell further out
-        # and _twist_along_astar's box-directed fallback closes the final gap.
+        # robot_r=0.30 keeps the swinging legs clear of the table edge during the orbit.
         astar_cfg = AstarConfig(arena_half=max(6.0, spawn_r_max + 1.0), robot_r=0.30)
         path = plan_path(spawn_np, approach_np, [PICK_TABLE_OBSTACLE], cfg=astar_cfg)
         if path is None or len(path) < 2:
@@ -362,7 +329,7 @@ def build_dataset(
 
     _snap_pick_commands_batched(base_env)
 
-    # Optional cinematic tracking camera matching the single-env fsm_continuous.py path.
+    # Optional offscreen tracking camera matching the single-env fsm_continuous.py path.
     writer = None
     renderer = None
     if video_path is not None:
@@ -399,9 +366,7 @@ def build_dataset(
         dist = torch.linalg.norm(dxy_to_box, dim=-1)
         base_vx = robot.data.root_link_lin_vel_b[:, 0].abs()
         base_wz = robot.data.root_link_ang_vel_b[:, 2].abs()
-        # Heading error (rad) from robot forward to the box, wrapped to [-pi, pi]. Used to
-        # keep the robot rotating toward the box inside the brake region and to gate the
-        # pick fire on being pointed at the box (pick's training dist is always face-on).
+        # Heading error (rad) from robot forward to the box, wrapped to [-pi, pi], used for brake-yaw and fire gating.
         r_quat = robot.data.root_link_quat_w
         r_w, r_xq, r_yq, r_zq = r_quat.unbind(-1)
         r_yaw = torch.atan2(2 * (r_w * r_zq + r_xq * r_yq), 1 - 2 * (r_yq * r_yq + r_zq * r_zq))
@@ -420,13 +385,7 @@ def build_dataset(
             twist = _twist_along_astar(base_env, astar_tracker, cfg.walk_speed_cap)
         else:
             twist = _twist_toward_box_batch(base_env, cfg.walk_speed_cap)
-        # Latch both the brake command and the counter once we enter the brake region: gait
-        # oscillation can push dist a few cm above walk_to_pick_dist for a handful of frames,
-        # and if we only latched the counter the twist would re-enable on every outward
-        # drift, re-accelerating the pelvis into the table and keeping base_vx above
-        # walk_to_pick_speed_max so the fire condition never triggered. Inside the brake we
-        # keep wz pointed at the box so the robot rotates in place to face the pick
-        # distribution (corner approaches used to fire off-axis).
+        # Latch brake twist and counter once dist crosses walk_to_pick_dist; keep wz pointed at the box so the robot rotates in place to face pick's training distribution.
         entered_brake = in_walk & (dist <= cfg.walk_to_pick_dist)
         brake_mask = in_walk & (entered_brake | (brake_counter > 0))
         if brake_mask.any():
@@ -530,7 +489,7 @@ def build_dataset(
 
 
 def _main() -> None:
-    """Parse CLI flags and invoke ``build_dataset`` to write one batched walk-to-pick .npz.
+    """Parse CLI flags and invoke build_dataset to write one batched walk-to-pick .npz.
     Args: none, reads --num-envs, --device, --out, --seed, --max-steps, --r-min, --r-max, --video-path, --astar from argv.
     Returns: none.
     """

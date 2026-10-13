@@ -1,16 +1,11 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
-##########################################################################################
 """Behaviour cloning driver for the unified student.
 
-Input:  ``outputs/walk_pick_sequential.npz`` (unified_obs, action, phase).
-Output: ``outputs/logs/g1_monolithic/<timestamp>/model_*.pt`` + TensorBoard scalars.
+Input: outputs/walk_pick_sequential.npz (unified_obs, action, phase).
+Output: outputs/logs/g1_monolithic/<timestamp>/model_*.pt plus TensorBoard scalars.
 
-The loss is per-joint MSE on the expert action. Phase-balanced sampling avoids
-the majority phase (walk usually dominates) drowning out pick/place. A small
-held-out split gives us a validation curve; the notebook plots both.
+The loss is per-joint MSE on the expert action. Phase-balanced sampling keeps the
+majority phase (walk) from drowning out pick and place. A small held-out split
+produces the validation curve plotted by the companion notebook.
 """
 
 from __future__ import annotations
@@ -99,8 +94,8 @@ def train_bc(
     cfg: BCConfig = BCConfig(),
     log_dir: Optional[Path | str] = None,
 ) -> Path:
-    """Train the unified student by behavioural cloning and log checkpoints + TB scalars.
-    Args: dataset_path: .npz produced by the FSM dataset builder; cfg: BCConfig hyperparameters; log_dir: output directory (defaults to ``outputs/logs/g1_monolithic/<timestamp>/``).
+    """Train the unified student by behavioural cloning and log checkpoints plus TB scalars.
+    Args: dataset_path: .npz produced by the FSM dataset builder; cfg: BCConfig hyperparameters; log_dir: output directory, defaults to outputs/logs/g1_monolithic/<timestamp>/.
     Returns: Path to the final-epoch checkpoint.
     """
     from torch.utils.tensorboard import SummaryWriter
@@ -175,9 +170,9 @@ def train_bc(
     return final
 
 
-def _main() -> None:
-    """CLI entrypoint that trains the student on ``outputs/walk_pick_sequential.npz``.
-    Args: none, parses --dataset, --epochs, --lr, --batch-size, --device from argv.
+def main() -> None:
+    """Parse CLI flags and train the student on the sequential dataset.
+    Args: none: reads --dataset, --epochs, --lr, --batch-size, --device from argv.
     Returns: none.
     """
     import argparse
@@ -195,4 +190,4 @@ def _main() -> None:
 
 
 if __name__ == "__main__":
-    _main()
+    main()

@@ -1,8 +1,3 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
-##########################################################################################
 """Unified student observation used across every FSM phase.
 
 Input:  a mjlab ManagerBasedRlEnv (any of the four phase envs); the current phase id; a GoalSample.
@@ -78,9 +73,9 @@ def _phase_one_hot(phase_id: int, num_envs: int, device) -> torch.Tensor:
 
 
 def _read_object_state(env) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (object_pos_w, object_quat_w, in_hand_flag). Zeros when the scene has no box.
-    Args: env: ManagerBasedRlEnv.
-    Returns: (n, 3), (n, 4), (n, 1) tensors.
+    """Read world-frame object pose and the pelvis-proximity in-hand flag, zero when no box.
+    Args: env: ManagerBasedRlEnv for the active phase.
+    Returns: (object_pos_w, object_quat_w, in_hand_flag) shaped (n, 3), (n, 4), (n, 1).
     """
     robot = env.scene["robot"]
     root_pos_w = robot.data.root_link_pos_w

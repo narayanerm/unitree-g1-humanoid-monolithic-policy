@@ -5,10 +5,10 @@
 ##########################################################################################
 """Unified goal-conditioned student policy trained by behaviour cloning.
 
-Input:  unified obs (num_envs, UNIFIED_OBS_DIM): proprioception + goal + phase one-hot.
+Input: unified obs (num_envs, UNIFIED_OBS_DIM) with proprioception, goal, phase one-hot.
 Output: joint position targets (num_envs, UNIFIED_ACT_DIM = 29).
 
-The MLP (Linear -> ELU x 3 -> Linear) mirrors the rsl-rl actor topology used by every
+The MLP (Linear, ELU x 3, Linear) mirrors the rsl-rl actor topology used by every
 expert so a later PPO fine-tune can warm-start into the trained student without shape
 mismatches.
 """
@@ -26,7 +26,7 @@ UNIFIED_ACT_DIM = 29
 
 
 class RunningMeanStd(nn.Module):
-    """Online mean/variance tracker used to normalise the student's input; a Module so PyTorch handles device moves and state_dict roundtrips."""
+    """Online mean/variance tracker for input normalisation; nn.Module so state_dict and device moves work."""
 
     def __init__(self, dim: int, eps: float = 1e-8):
         """Initialise the running-stats buffers.
@@ -68,7 +68,7 @@ class RunningMeanStd(nn.Module):
 
 
 class MonolithicPolicyStudent(nn.Module):
-    """MLP goal-conditioned student policy: unified_obs -> joint position targets."""
+    """MLP goal-conditioned student policy mapping unified_obs to joint position targets."""
 
     def __init__(
         self,

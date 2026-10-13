@@ -3,9 +3,7 @@
 # Developer  : Narayane Ribeiro Medeiros                                                 #
 # Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
-"""Helpers shared by ``src.fsm_continuous_batch`` for the walk->pick FSM path.
-
-"""
+"""Helpers shared by `src.fsm_continuous_batch` for the walk to pick FSM path."""
 
 from __future__ import annotations
 
@@ -41,7 +39,7 @@ class RolloutConfig:
     carry_arrival_dist: float = 0.22      # radial gate; combined with carry_x_max=-1.90 fires reliably for the various carry end-poses (y-drift up to 0.16 m)
     drop_success_box_z_max: float = 0.68  # box resting on table 2 top (0.585 + 0.1 margin)
     drop_success_horiz: float = 0.40      # box within Table 2 top footprint (0.34 x 0.42 half-extent)
-    place_descent_steps: int = 12          # bypasses trained drop expert (unstable at carry->drop handover); fast lerp of box from hands to Table 2 top over ~0.24 s
+    place_descent_steps: int = 12          # bypasses trained drop expert (unstable at carry to drop handover); fast lerp of box from hands to Table 2 top over ~0.24 s
     place_settle_steps: int = 40           # frames box sits on table + robot balances before walk_return
     place_forward_shift: float = 0.05      # unused (kept for tuning knob compatibility)
     return_walk_target_xy: tuple[float, float] = (-0.70, 0.0)  # drop ends near world_x=-1.7; -0.7 gives 1 m walk in front of camera
@@ -58,17 +56,17 @@ class RolloutConfig:
     walk_speed_cap: float = 0.7            # base-frame vx cap for locomotion experts
     carry_speed_cap: float = 0.45          # slower so the box does not slosh out
     carry_pursuit_lookahead: float = 0.6   # metres ahead of robot x for pure-pursuit waypoint on y=0; smaller = tighter lateral correction (more oscillation), larger = smoother (more drift); 0.6 m ~= 1.5 stride
-    carry_y_abs_max_tight: float = 0.20    # relaxed 0.08 -> 0.20 (iter3, 2026-08-17): tight gate hung the FSM because carry converges asymptotically to ~15 cm lateral offset under load; drop now snaps place_target to robot_y so any offset within TABLE2_HALF_Y=0.42 still lands the box on the tabletop
+    carry_y_abs_max_tight: float = 0.20    # relaxed 0.08 to 0.20 (iter3, 2026-08-17): tight gate hung the FSM because carry converges asymptotically to ~15 cm lateral offset under load; drop now snaps place_target to robot_y so any offset within TABLE2_HALF_Y=0.42 still lands the box on the tabletop
     table2_xy: tuple[float, float] = (-2.5, 0.0)  # behind spawn so carry is a 180 deg turn + straight walk (mirrors iteration 23 no-table-2 run that worked)
     carry_target_xy: tuple[float, float] = (-2.03, 0.0)  # -2.00 balances policy stability (further makes it fall ~50% of runs) with box landing on Table 2 top; box sits BOX_HOLD_X_OFFSET=0.32 ahead so lands between x=-2.17 and -2.47
     carry_x_max: float = -1.90             # hand-off gate: robot past x=-1.90 (asymptotic end given target -2.03 with 0.15 arrival radius); guarantees held box sits ~x<=-2.22, at least 6 cm past Table 2's front edge -2.16
-    carry_y_abs_max: float = 0.20          # hand-off gate: loosened 0.10 -> 0.20 to absorb carry drift at this seed; carry_brake stage below shapes the handoff state, not this cap
+    carry_y_abs_max: float = 0.20          # hand-off gate: loosened 0.10 to 0.20 to absorb carry drift at this seed; carry_brake stage below shapes the handoff state, not this cap
     carry_brake_min_steps: int = 20        # intermediate state mirroring walk's brake-before-pick: carry keeps running (so box stays gripped) with twist=zero; exit when |base_vx| < carry_brake_speed_max AND |base_wz| < carry_brake_ang_speed_max or max-step fires; brings (pose, velocity) inside drop's training envelope (drop was trained from resets with all velocities zeroed)
-    carry_brake_max_steps: int = 400       # bumped 200 -> 300 -> 400 to give two-stage brake time to reposition and yaw-align
+    carry_brake_max_steps: int = 400       # bumped 200 to 300 to 400 to give two-stage brake time to reposition and yaw-align
     carry_brake_speed_max: float = 0.12    # base_lin_vel_b norm below this to declare settled
     carry_brake_ang_speed_max: float = 0.35
     carry_brake_heading_err_max: float = 0.10   # ~5.7 deg residual yaw to Table 2 before handoff to drop
-    carry_brake_lateral_err_max: float = 0.25   # relaxed 0.05 -> 0.25 (iter3, 2026-08-17): tight gate assumed lateral drift could be corrected during brake, but 2026-08-17 experiments showed carry has zero yaw authority under load; drop now snaps place_target to robot_y so any offset within table 2 half-extent lands the box; 0.25 keeps a safety cap so obviously-broken runs time out
+    carry_brake_lateral_err_max: float = 0.25   # relaxed 0.05 to 0.25 (iter3, 2026-08-17): tight gate assumed lateral drift could be corrected during brake, but 2026-08-17 experiments showed carry has zero yaw authority under load; drop now snaps place_target to robot_y so any offset within table 2 half-extent lands the box; 0.25 keeps a safety cap so obviously-broken runs time out
     carry_brake_dist_max: float = 0.05     # 5 cm radial gate to carry_target_xy: farther than this the two-stage brake keeps walking with vx+wz to reposition; only then switches to pure yaw-align (carry ignores vy so walking toward target with wz steering is the only lateral correction)
     carry_brake_reposition_speed_cap: float = 0.18   # capped below carry_speed_cap so reposition stage is a slow crawl (arms stable), still large enough to overcome walk expert's minimum stride
     drop_max_steps: int = 400              # trained policy hand-off, enters with velocities near zero (see carry_brake)
@@ -145,8 +143,7 @@ def _twist_toward(
     Args: base_env: shared env; target_xy_w: (n, 2) world-frame target xy; speed_cap: max forward speed (m/s).
     Returns: (n, 3) tensor of (vx_b, vy_b, wz).
     """
-    # Isolating rotation and forward motion avoids the crooked side-step gait produced
-    # by an earlier vx+vy formulation.
+    # Isolating rotation from forward motion avoids the crooked side-step gait that an earlier vx+vy formulation produced.
     robot = base_env.scene["robot"]
     root_pos = robot.data.root_link_pos_w[:, :2]
     dxy_w = target_xy_w - root_pos

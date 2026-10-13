@@ -1,8 +1,3 @@
-##########################################################################################
-# Project    : unitree-g1-humanoid-monolithic-policy                                     #
-# Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
-##########################################################################################
 """G1 pick task definition shared by training and analysis notebooks.
 
 The G1 humanoid stands in front of a table, reaches for a box with both hands,
@@ -136,7 +131,7 @@ SQUAT_GRIP_ROOT_POS = (0.0, 0.0, 0.65)
 SQUAT_GRIP_ROOT_ROT = (1.0, 0.0, 0.0, 0.0)  # identity: waist_pitch carries the trunk lean via joints
 
 
-# Full-body carry-ready pose: KNEES_BENT_KEYFRAME legs (mjlab canonical G1 home used by walk/carry) + waist upright + HOLDING_ARM_POSE arms wrapped around the box. Used as the target for carry_ready_pose_reward so a walk -> pick -> carry state-machine handoff sees consistent postures at every transition.
+# Full-body carry-ready pose: KNEES_BENT_KEYFRAME legs (mjlab canonical G1 home used by walk/carry) + waist upright + HOLDING_ARM_POSE arms wrapped around the box. Used as the target for carry_ready_pose_reward so a walk to pick to carry state-machine handoff sees consistent postures at every transition.
 CARRY_READY_POSE = {
     # Legs (KNEES_BENT_KEYFRAME): hips pitched back slightly, knees bent, ankles compensating.
     "left_hip_pitch_joint":   -0.312,
@@ -186,7 +181,7 @@ GRASP_NOMINAL_Y   = 0.13   # left-hand nominal y in box frame (right mirrors)
 GRASP_NOMINAL_Z   = 0.02
 GRASP_JITTER      = 0.03
 
-# Box always spawns resting on the table with tight +/-5 cm xy and +/-20 deg yaw jitter; the pick curriculum only modulates the robot's starting pose (SQUAT_GRIP -> walk buffer), never the box spawn.
+# Box always spawns resting on the table with tight +/-5 cm xy and +/-20 deg yaw jitter; the pick curriculum only modulates the robot's starting pose (SQUAT_GRIP to walk buffer), never the box spawn.
 OBJECT_XY_JITTER_X = 0.05
 OBJECT_XY_JITTER_Y = 0.05
 OBJECT_YAW_RANGE   = math.radians(20.0)
@@ -647,7 +642,7 @@ def action_rate_l2(env):
 def action_2nd_order_l2(env):
     """Squared L2 penalty on action second-order difference (jerk); complements action_rate per the ETH ANYmal smoothness bundle.
     Args: env: the RL env.
-    Returns: (num_envs,) tensor of |a_t − 2·a_{t−1} + a_{t−2}|² summed over joints.
+    Returns: (num_envs,) tensor of |a_t - 2*a_{t-1} + a_{t-2}|^2 summed over joints.
     """
     a = env.action_manager.action
     a1 = env.action_manager.prev_action
@@ -690,7 +685,7 @@ def grip_force_reward(env, sensor_name: str = "hand_box_contact",
                       target_force: float = 5.0):
     """Reward positive normal force between robot and box, saturating at target_force.
     Args: env: RL env; sensor_name: ContactSensor name; target_force: N at which reward saturates.
-    Returns: (num_envs,) tensor in [0, 1]. Ground-truth signal that grip is firm.
+    Returns: (num_envs,) tensor in [0, 1].
     """
     sensor = env.scene[sensor_name]
     if sensor.data.force is not None:
@@ -1022,7 +1017,7 @@ def symmetric_pose_penalty(env, left_cfg, right_cfg):
 def gated_reach_reward(env, hand_cfg, box_cfg, trunk_cfg, sensor_name, side: str, std: float = 0.20):
     """Stability-gated wrapper over reach_reward for one hand.
     Args: env: RL env; hand_cfg: hand entity; box_cfg: box entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate; side: "left" or "right"; std: Gaussian bandwidth.
-    Returns: (num_envs,) tensor equal to reach_reward × stability_gate.
+    Returns: (num_envs,) tensor equal to reach_reward times stability_gate.
     """
     return reach_reward(env, hand_cfg, box_cfg, side, std) * stability_gate(env, trunk_cfg, sensor_name)
 
@@ -1030,7 +1025,7 @@ def gated_reach_reward(env, hand_cfg, box_cfg, trunk_cfg, sensor_name, side: str
 def gated_both_hands_hit_bonus(env, left_hand_cfg, right_hand_cfg, box_cfg, trunk_cfg, sensor_name, threshold: float = 0.08):
     """Stability-gated wrapper over both_hands_hit_bonus.
     Args: env: RL env; left_hand_cfg: left hand entity; right_hand_cfg: right hand entity; box_cfg: box entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate; threshold: hit distance in metres.
-    Returns: (num_envs,) tensor equal to both_hands_hit_bonus × stability_gate.
+    Returns: (num_envs,) tensor equal to both_hands_hit_bonus times stability_gate.
     """
     return both_hands_hit_bonus(env, left_hand_cfg, right_hand_cfg, box_cfg, threshold) * stability_gate(env, trunk_cfg, sensor_name)
 
@@ -1038,7 +1033,7 @@ def gated_both_hands_hit_bonus(env, left_hand_cfg, right_hand_cfg, box_cfg, trun
 def gated_hold_box_reward(env, left_hand_cfg, right_hand_cfg, box_cfg, trunk_cfg, sensor_name):
     """Stability-gated wrapper over hold_box_reward.
     Args: env: RL env; left_hand_cfg: left hand entity; right_hand_cfg: right hand entity; box_cfg: box entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate.
-    Returns: (num_envs,) tensor equal to hold_box_reward × stability_gate.
+    Returns: (num_envs,) tensor equal to hold_box_reward times stability_gate.
     """
     return hold_box_reward(env, left_hand_cfg, right_hand_cfg, box_cfg) * stability_gate(env, trunk_cfg, sensor_name)
 
@@ -1051,7 +1046,7 @@ def gated_box_at_lift_target_pos_reward(
 ):
     """Stability-gated wrapper over box_at_lift_target_pos_reward.
     Args: env: RL env; box_cfg: box entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate; sigma_xy: symmetric xy bandwidth; sigma_z_below/sigma_z_above: asymmetric z bandwidths.
-    Returns: (num_envs,) tensor equal to box_at_lift_target_pos_reward × stability_gate.
+    Returns: (num_envs,) tensor equal to box_at_lift_target_pos_reward times stability_gate.
     """
     return box_at_lift_target_pos_reward(
         env, box_cfg, sigma_xy=sigma_xy,
@@ -1062,7 +1057,7 @@ def gated_box_at_lift_target_pos_reward(
 def gated_box_at_lift_target_quat_reward(env, box_cfg, trunk_cfg, sensor_name):
     """Stability-gated wrapper over box_at_lift_target_quat_reward.
     Args: env: RL env; box_cfg: box entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate.
-    Returns: (num_envs,) tensor equal to box_at_lift_target_quat_reward × stability_gate.
+    Returns: (num_envs,) tensor equal to box_at_lift_target_quat_reward times stability_gate.
     """
     return box_at_lift_target_quat_reward(env, box_cfg) * stability_gate(env, trunk_cfg, sensor_name)
 
@@ -1073,7 +1068,7 @@ def gated_lift_progress_reward(
 ):
     """Stability-gated wrapper over lift_progress_reward.
     Args: env: RL env; box_cfg: box entity; left_hand_cfg: left hand entity; right_hand_cfg: right hand entity; trunk_cfg: trunk entity for the gate; sensor_name: feet contact sensor for the gate; hold_dist: max hand-to-anchor distance for the holding gate.
-    Returns: (num_envs,) tensor equal to lift_progress_reward × stability_gate.
+    Returns: (num_envs,) tensor equal to lift_progress_reward times stability_gate.
     """
     return lift_progress_reward(
         env, box_cfg, left_hand_cfg, right_hand_cfg, hold_dist,
@@ -1445,7 +1440,7 @@ def pick_curriculum(env, env_ids):
             env._pick_curriculum_step = 0
         env._pick_curriculum_step += 1
         step = env._pick_curriculum_step
-    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 -> 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses.
+    # Two-phase smooth ramp: hold body_bias=1.0 for the first 24k steps so the policy learns the pick/lift dynamics from an ideal start, then smoothstep 1.0 down to 0.0 across the next 72k steps as the robot gradually starts from realistic walk poses.
     if step < 24_000:
         body_bias = 1.0
     elif step < 96_000:
@@ -1638,7 +1633,7 @@ def build_g1_pick_mdp():
         "grip_force": RewardTermCfg(func=grip_force_reward, weight=5.0,
                                     params={"sensor_name": "hand_box_contact",
                                             "target_force": 20.0}),
-        # Lift target with asymmetric z-kernel (broad below to pull up from squat, narrow above to punish overshoot); weight bumped 2.0 -> 4.0.
+        # Lift target with asymmetric z-kernel (broad below to pull up from squat, narrow above to punish overshoot); weight bumped 2.0 to 4.0.
         "box_at_lift_target_pos":  RewardTermCfg(func=gated_box_at_lift_target_pos_reward,  weight=4.0,
                                                  params={"box_cfg": box, "trunk_cfg": trunk,
                                                          "sensor_name": "feet_ground_contact",
@@ -1667,26 +1662,26 @@ def build_g1_pick_mdp():
                                                "trunk_cfg": trunk,
                                                "sensor_name": "feet_ground_contact",
                                                "hold_dist": 0.10}),
-        # Fused upright + feet_on_ground stability bundle (weights bumped 1.0 -> 5.0 to fix critic collapse: posture was too small vs task rewards to shape a non-trivial value function).
+        # Fused upright + feet_on_ground stability bundle (weights bumped 1.0 to 5.0 to fix critic collapse: posture was too small vs task rewards to shape a non-trivial value function).
         "stability": RewardTermCfg(
             func=stability_bundle_reward, weight=1.0,
             params={"trunk_cfg": trunk, "pelvis_cfg": pelvis,
                     "sensor_name": "feet_ground_contact",
                     "w_upright": 10.0, "w_upright_pelvis": 5.0, "w_feet": 5.0},
         ),
-        # Weight bumped -0.5 -> -2.0 to stop free arm jitter during the hold phase (at -0.5 the penalty was trivial vs +30 stability + +5 grip_force).
+        # Weight bumped -0.5 to -2.0 to stop free arm jitter during the hold phase (at -0.5 the penalty was trivial vs +30 stability + +5 grip_force).
         "stay_still":     RewardTermCfg(func=stay_still_penalty,    weight=-2.0,
                                         params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,
                                                 "box_cfg": box, "gate_dist": 0.20}),
         "symmetric_pose": RewardTermCfg(func=symmetric_pose_penalty, weight=-0.3,
                                         params={"left_cfg": left_sym, "right_cfg": right_sym}),
-        # ETH ANYmal-style smoothness bundle: action_rate and dof_vel bumped 2× (action_rate -3e-2 -> -6e-2, dof_vel -5e-3 -> -1e-2) to further suppress the aggressive/whippy motion + post-grasp wiggle observed at eval: the previous scaling still let the mean policy learn oscillatory targets.
+        # ETH ANYmal-style smoothness bundle: action_rate and dof_vel bumped 2x (action_rate -3e-2 to -6e-2, dof_vel -5e-3 to -1e-2) to suppress the whippy motion plus post-grasp wiggle observed at eval; the previous scaling still let the mean policy learn oscillatory targets.
         "action_rate_l2": RewardTermCfg(func=action_rate_l2,           weight=-6.0e-2),
-        # Second-order (jerk) term: |a_t − 2a_{t−1} + a_{t−2}|².
+        # Second-order (jerk) term: |a_t - 2*a_{t-1} + a_{t-2}|^2.
         "action_2nd_order": RewardTermCfg(func=action_2nd_order_l2,    weight=-1.0e-2),
         # Joint velocity: penalise fast joints in general.
         "dof_vel_l2":       RewardTermCfg(func=dof_vel_l2,             weight=-1.0e-2),
-        # Weight relaxed -3.0 -> -1.0: hands legitimately move fast near the box during a squeeze, and the stronger penalty was fighting the pick task (last run showed accumulated -1.59 growing throughout training).
+        # Weight relaxed -3.0 to -1.0: hands legitimately move fast near the box during a squeeze, and the stronger penalty was fighting the pick task (last run showed accumulated -1.59 growing throughout training).
         "hand_approach_vel": RewardTermCfg(
             func=hand_approach_velocity_penalty, weight=-1.0,
             params={"left_hand_cfg": left_hand, "right_hand_cfg": right_hand,

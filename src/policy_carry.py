@@ -680,7 +680,7 @@ def build_g1_carry_mdp():
         ),
     }
 
-    # Events (reset order matters): default scene -> place robot+box together -> arms to hold pose -> DR.
+    # Events (reset order matters): default scene, then place robot+box together, then arms to hold pose, then DR.
     events = {
         "reset_scene": EventTermCfg(
             func=reset_scene_to_default,
