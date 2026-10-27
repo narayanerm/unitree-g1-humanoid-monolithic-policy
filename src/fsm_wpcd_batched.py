@@ -61,6 +61,17 @@ CARRY_OBS_DIM = 124
 DROP_OBS_DIM = 147
 
 
+def _fmt_hms(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS for the ETA log line.
+    Args: seconds: non-negative duration.
+    Returns: zero-padded HH:MM:SS string.
+    """
+    s = max(0, int(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _resample_spawn_outside_t2(
     spawn_xy: torch.Tensor,
     box_xy: torch.Tensor,
@@ -913,11 +924,17 @@ def build_dataset_wpcd(
         if verbose and step % 50 == 0:
             dist_t2_dbg = torch.linalg.norm(table2_world_xy - robot.data.root_link_pos_w[:, :2], dim=-1)
             d_in_carry = dist_t2_dbg[in_carry] if in_carry.any() else torch.tensor([-1.0])
-            print(f"[wpcd] step {step:4d} active={int(active.sum())} "
+            elapsed_s = time.time() - t0
+            pace_s = elapsed_s / max(1, step + 1)
+            eta_s = max(0, cfg.max_steps - step - 1) * pace_s
+            pct = 100.0 * (step + 1) / max(1, cfg.max_steps)
+            print(f"[wpcd] step {step:4d}/{cfg.max_steps} ({pct:5.1f}%) "
+                  f"active={int(active.sum())} "
                   f"W={int(in_walk.sum())} P={int(in_pick.sum())} C={int(in_carry.sum())} D={int(in_drop.sum())} S={int(in_post_drop.sum())} "
                   f"fires P={int(fires_pick_ever.sum())}/C={int(fires_carry_ever.sum())}/D={int(fires_drop_ever.sum())} "
                   f"done={int(drop_done_ever.sum())} falls={int(fell_ever.sum())} "
-                  f"d_t2(C)=[{d_in_carry.min().item():.2f},{d_in_carry.max().item():.2f}]")
+                  f"d_t2(C)=[{d_in_carry.min().item():.2f},{d_in_carry.max().item():.2f}] "
+                  f"| elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}")
 
     wall = time.time() - t0
     if writer is not None:
