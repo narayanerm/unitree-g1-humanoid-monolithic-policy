@@ -395,11 +395,12 @@ def build_dataset_wpcd(
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = num_envs
     env_cfg.scene.env_spacing = env_spacing
-    # Sparse Jacobian: with a 2nd table doubling bodies and nworld >= 1024, the
-    # dense efc.J ((nworld, njmax_pad, nv_pad)) was blowing past 380 MB and the
-    # mjwarp GPU allocator was failing. Sparse packs efc.J into (nworld, 1,
-    # njmax_nnz) which stays small enough for 8192 envs on 31 GB VRAM.
-    env_cfg.sim.mujoco.jacobian = "sparse"
+    # Pick env defaults (nconmax=200 njmax=800 jacobian=auto) are kept.
+    # Earlier runs forced sparse + half caps to fit 1024+ envs in 31 GB VRAM,
+    # but the drop expert produced |action|~1e6 outputs in those runs (likely
+    # NaN propagation under over-constrained solver), destroying the BC dataset
+    # for the drop phase. If you hit mjwarp OOM at high num_envs, lower
+    # num_envs instead; do not re-add the sparse/tight-cap workaround.
     table2_rel_xy_np = _sample_table2_positions_np(num_envs, table2_r_min, table2_r_max, seed)
     env_cfg.scene.spec_fn = _make_two_tables_spec_fn(num_envs, env_spacing, table2_rel_xy_np)
     _disable_terminations(env_cfg)
@@ -983,6 +984,31 @@ def build_dataset_wpcd(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(str(out_path), unified_obs=unified_arr, action=action_arr, phase=phase_arr)
 
+    # Per-phase outlier check. Sanely trained experts produce actions bounded
+    # by clip_actions~3 and empirically topping out around 25 in the pick
+    # phase. If any phase exceeds OUTLIER_THRESHOLD = 50 the solver likely
+    # went unstable (seen when nconmax/njmax were tightened too aggressively);
+    # downstream BC on this dataset will be dominated by the outliers.
+    OUTLIER_THRESHOLD = 50.0
+    phase_names = ["walk", "pick", "carry", "drop", "post"]
+    outlier_report: dict[str, dict] = {}
+    for pid in sorted(set(phase_arr.tolist())):
+        mask = phase_arr == pid
+        a = action_arr[mask]
+        if a.size == 0:
+            continue
+        abs_max = np.abs(a).max(axis=1)
+        pct_outlier = float((abs_max > OUTLIER_THRESHOLD).mean())
+        outlier_report[phase_names[int(pid)]] = {
+            "N": int(mask.sum()),
+            "act_min": float(a.min()),
+            "act_max": float(a.max()),
+            "act_std": float(a.std()),
+            "pct_outlier_abs_gt_50": pct_outlier,
+        }
+        if pct_outlier > 0.01 and verbose:
+            print(f"[wpcd][WARN] phase {phase_names[int(pid)]!r}: {pct_outlier*100:.1f}% of samples have |action|>{OUTLIER_THRESHOLD}; dataset is likely corrupted for this phase")
+
     stats = {
         "transitions_written": int(unified_arr.shape[0]),
         "fires_pick": int(fires_pick_ever.sum()),
@@ -993,6 +1019,7 @@ def build_dataset_wpcd(
         "success_rate": float(drop_done_ever.sum()) / max(1, num_envs),
         "wall_s": wall,
         "out_path": str(out_path),
+        "outlier_report": outlier_report,
     }
     if verbose:
         print(f"[wpcd] wrote {out_path} ({unified_arr.shape[0]} transitions, {out_path.stat().st_size/1e6:.1f} MB)")

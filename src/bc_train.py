@@ -61,10 +61,11 @@ def _make_split(
     phase: np.ndarray,
     val_frac: float,
     seed: int = 0,
-) -> tuple[TensorDataset, TensorDataset, np.ndarray]:
+    sample_weights: np.ndarray | None = None,
+) -> tuple[TensorDataset, TensorDataset, np.ndarray, np.ndarray | None]:
     """Split obs/act/phase into train and val TensorDatasets deterministically.
-    Args: obs: (N, D) observations; act: (N, A) actions; phase: (N,) phase ids; val_frac: fraction to hold out; seed: RNG seed.
-    Returns: (train_ds, val_ds, train_phase_np), the two datasets and the train-side phase array for the balanced sampler.
+    Args: obs: (N, D) observations; act: (N, A) actions; phase: (N,) phase ids; val_frac: fraction to hold out; seed: RNG seed; sample_weights: optional (N,) per-row weights passed through to the train split.
+    Returns: (train_ds, val_ds, train_phase_np, train_weights_np) with the per-split weight slice when provided.
     """
     rng = np.random.default_rng(seed)
     n = obs.shape[0]
@@ -81,18 +82,22 @@ def _make_split(
         torch.from_numpy(obs[val_idx]).float(),
         torch.from_numpy(act[val_idx]).float(),
     )
-    return train_ds, val_ds, phase[tr_idx]
+    train_weights = None if sample_weights is None else sample_weights[tr_idx]
+    return train_ds, val_ds, phase[tr_idx], train_weights
 
 
-def _phase_balanced_sampler(phase_np: np.ndarray) -> WeightedRandomSampler:
-    """Build an inverse-frequency WeightedRandomSampler so batches mix phases.
-    Args: phase_np: (N_train,) int array of phase ids in [0, NUM_PHASES).
+def _phase_balanced_sampler(phase_np: np.ndarray, dataset_weights: np.ndarray | None = None) -> WeightedRandomSampler:
+    """Build a WeightedRandomSampler so batches mix phases, using dataset_weights when provided.
+    Args: phase_np: (N_train,) int array of phase ids in [0, NUM_PHASES); dataset_weights: optional (N_train,) per-row weights produced upstream.
     Returns: WeightedRandomSampler covering N_train indices with replacement.
     """
-    counts = np.bincount(phase_np, minlength=NUM_PHASES).astype(np.float64)
-    counts[counts == 0.0] = 1.0
-    inv_freq = 1.0 / counts
-    weights = inv_freq[phase_np]
+    if dataset_weights is not None:
+        weights = dataset_weights.astype(np.float64)
+    else:
+        counts = np.bincount(phase_np, minlength=NUM_PHASES).astype(np.float64)
+        counts[counts == 0.0] = 1.0
+        inv_freq = 1.0 / counts
+        weights = inv_freq[phase_np]
     return WeightedRandomSampler(
         weights=torch.from_numpy(weights).double(),
         num_samples=len(phase_np),
@@ -113,12 +118,33 @@ def train_bc(
 
     blob = np.load(str(dataset_path))
     obs, act, phase = blob["unified_obs"], blob["action"], blob["phase"]
-    print(f"[bc] dataset: {obs.shape[0]} transitions, obs={obs.shape[1]}, act={act.shape[1]}")
+    sample_weights = blob["sample_weights"] if "sample_weights" in blob.files else None
+    print(f"[bc] dataset: {obs.shape[0]} transitions, obs={obs.shape[1]}, act={act.shape[1]}" + (" (with sample_weights)" if sample_weights is not None else ""))
 
-    train_ds, val_ds, train_phase = _make_split(obs, act, phase, cfg.val_frac)
+    # Drop corrupted samples with absurd action magnitudes before computing
+    # the normalizer or the loss. Sanely trained experts produce actions
+    # bounded by clip_actions~3 and empirically peaking around 25 in pick;
+    # anything over 50 came from an unstable solver run (NaN propagation
+    # through the drop expert's MLP) and would dominate the MSE.
+    OUTLIER_THRESHOLD = 50.0
+    keep = np.abs(act).max(axis=1) < OUTLIER_THRESHOLD
+    n_drop = int((~keep).sum())
+    if n_drop > 0:
+        pct = 100.0 * n_drop / len(act)
+        print(f"[bc] filtering {n_drop} outlier samples with |action|>{OUTLIER_THRESHOLD} ({pct:.2f}% of dataset)")
+        per_phase = {int(p): int(((~keep) & (phase == p)).sum()) for p in sorted(set(phase.tolist()))}
+        print(f"[bc]   outliers per phase: {per_phase}")
+        obs = obs[keep]
+        act = act[keep]
+        phase = phase[keep]
+        if sample_weights is not None:
+            sample_weights = sample_weights[keep]
+        print(f"[bc] dataset after filter: {obs.shape[0]} transitions")
+
+    train_ds, val_ds, train_phase, train_weights = _make_split(obs, act, phase, cfg.val_frac, sample_weights=sample_weights)
 
     if cfg.balance_phases:
-        sampler = _phase_balanced_sampler(train_phase)
+        sampler = _phase_balanced_sampler(train_phase, dataset_weights=train_weights)
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler)
     else:
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
