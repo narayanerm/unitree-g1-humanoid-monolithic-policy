@@ -128,11 +128,14 @@ def _make_two_tables_spec_fn(num_envs: int, env_spacing: float, table2_rel_xy: n
     offsets = _env_origin_offsets(num_envs, env_spacing)
 
     def _spec_fn(spec: mujoco.MjSpec) -> None:
-        # Enlarge the MuJoCo stack arena so mj_forward can run the broad-phase
-        # contact pass over the combined (num_envs * (robot + 2 tables + box))
-        # scene; the auto default (~32 MB) overflows past ~1k envs. Clamp to
-        # 2 GB (safe int32 cap); if 8192+ envs still fail, split the dataset.
-        spec.memory = 2 * (1 << 30)
+        # Scale the MuJoCo stack arena with num_envs: mj_forward's broad-phase
+        # contact pass needed ~66 KB/env in practice (8192 envs -> 540 MB).
+        # Floor at the auto default (~32 MB) for small runs, cap at 1 GB so
+        # the mjwarp GPU arrays downstream don't inflate past VRAM: setting a
+        # flat 2 GB blew up a single 380 MB allocation on the GPU side.
+        per_env_bytes = 128 * 1024  # 2x the empirical worst-case per env
+        arena = max(32 * (1 << 20), per_env_bytes * num_envs)
+        spec.memory = min(arena, 1 * (1 << 30))
         leg_len_z = TABLE_HEIGHT - TABLE_TOP_HALF
         leg_half_z = leg_len_z / 2.0
         leg_center_z = leg_half_z - TABLE_HEIGHT
