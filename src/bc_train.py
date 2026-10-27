@@ -18,7 +18,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler, TensorDataset
 
 from src.student_policy import MonolithicPolicyStudent
 
@@ -55,54 +54,31 @@ class BCConfig:
     device: str = "cuda:0"
 
 
-def _make_split(
-    obs: np.ndarray,
-    act: np.ndarray,
-    phase: np.ndarray,
-    val_frac: float,
-    seed: int = 0,
-    sample_weights: np.ndarray | None = None,
-) -> tuple[TensorDataset, TensorDataset, np.ndarray, np.ndarray | None]:
-    """Split obs/act/phase into train and val TensorDatasets deterministically.
-    Args: obs: (N, D) observations; act: (N, A) actions; phase: (N,) phase ids; val_frac: fraction to hold out; seed: RNG seed; sample_weights: optional (N,) per-row weights passed through to the train split.
-    Returns: (train_ds, val_ds, train_phase_np, train_weights_np) with the per-split weight slice when provided.
+def _make_split_indices(n: int, val_frac: float, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic train/val index permutation; returns NumPy arrays for later slicing of GPU tensors.
+    Args: n: dataset size; val_frac: fraction to hold out; seed: RNG seed.
+    Returns: (train_idx, val_idx) numpy int arrays.
     """
     rng = np.random.default_rng(seed)
-    n = obs.shape[0]
     perm = rng.permutation(n)
     n_val = max(1, int(round(n * val_frac)))
-    val_idx = perm[:n_val]
-    tr_idx = perm[n_val:]
-
-    train_ds = TensorDataset(
-        torch.from_numpy(obs[tr_idx]).float(),
-        torch.from_numpy(act[tr_idx]).float(),
-    )
-    val_ds = TensorDataset(
-        torch.from_numpy(obs[val_idx]).float(),
-        torch.from_numpy(act[val_idx]).float(),
-    )
-    train_weights = None if sample_weights is None else sample_weights[tr_idx]
-    return train_ds, val_ds, phase[tr_idx], train_weights
+    return perm[n_val:], perm[:n_val]
 
 
-def _phase_balanced_sampler(phase_np: np.ndarray, dataset_weights: np.ndarray | None = None) -> WeightedRandomSampler:
-    """Build a WeightedRandomSampler so batches mix phases, using dataset_weights when provided.
-    Args: phase_np: (N_train,) int array of phase ids in [0, NUM_PHASES); dataset_weights: optional (N_train,) per-row weights produced upstream.
-    Returns: WeightedRandomSampler covering N_train indices with replacement.
+def _phase_balanced_weights_gpu(
+    phase_t: torch.Tensor,
+    dataset_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-sample sampling weights on-device for ``torch.multinomial`` phase-balanced sampling.
+    Args: phase_t: (N,) long tensor of phase ids on the training device; dataset_weights: optional (N,) tensor of per-row weights that overrides inverse-frequency.
+    Returns: (N,) float64 tensor of normalized sampling weights.
     """
     if dataset_weights is not None:
-        weights = dataset_weights.astype(np.float64)
-    else:
-        counts = np.bincount(phase_np, minlength=NUM_PHASES).astype(np.float64)
-        counts[counts == 0.0] = 1.0
-        inv_freq = 1.0 / counts
-        weights = inv_freq[phase_np]
-    return WeightedRandomSampler(
-        weights=torch.from_numpy(weights).double(),
-        num_samples=len(phase_np),
-        replacement=True,
-    )
+        return dataset_weights.double()
+    counts = torch.bincount(phase_t, minlength=NUM_PHASES).double()
+    counts = counts.clamp(min=1.0)
+    inv_freq = 1.0 / counts
+    return inv_freq[phase_t]
 
 
 def train_bc(
@@ -141,18 +117,39 @@ def train_bc(
             sample_weights = sample_weights[keep]
         print(f"[bc] dataset after filter: {obs.shape[0]} transitions")
 
-    train_ds, val_ds, train_phase, train_weights = _make_split(obs, act, phase, cfg.val_frac, sample_weights=sample_weights)
+    # Fast path: preload the whole dataset onto the GPU once, then sample
+    # batches on-device via torch.multinomial. Removes the ~1.7 TB of
+    # host-to-device copies the DataLoader path incurred over 1k epochs on a
+    # 1.7 GB dataset. TF32 matmul is enabled for the student MLP.
+    torch.set_float32_matmul_precision("high")
+    device = cfg.device if torch.cuda.is_available() else "cpu"
+    print(f"[bc] moving dataset to {device} ({obs.nbytes/1e9 + act.nbytes/1e9:.2f} GB)...", flush=True)
+    obs_t = torch.from_numpy(obs).float().to(device, non_blocking=True)
+    act_t = torch.from_numpy(act).float().to(device, non_blocking=True)
+    phase_t = torch.from_numpy(phase.astype(np.int64)).to(device, non_blocking=True)
+    weights_full = None
+    if sample_weights is not None:
+        weights_full = torch.from_numpy(sample_weights.astype(np.float64)).to(device, non_blocking=True)
+
+    tr_idx_np, val_idx_np = _make_split_indices(obs_t.shape[0], cfg.val_frac, seed=0)
+    tr_idx = torch.from_numpy(tr_idx_np).to(device, non_blocking=True)
+    val_idx = torch.from_numpy(val_idx_np).to(device, non_blocking=True)
+    tr_obs = obs_t[tr_idx]
+    tr_act = act_t[tr_idx]
+    tr_phase = phase_t[tr_idx]
+    val_obs = obs_t[val_idx]
+    val_act = act_t[val_idx]
+    del obs_t, act_t, phase_t
 
     if cfg.balance_phases:
-        sampler = _phase_balanced_sampler(train_phase, dataset_weights=train_weights)
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, sampler=sampler)
+        sampler_weights = _phase_balanced_weights_gpu(
+            tr_phase, dataset_weights=(weights_full[tr_idx] if weights_full is not None else None),
+        )
     else:
-        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+        sampler_weights = None
 
-    device = cfg.device if torch.cuda.is_available() else "cpu"
     student = MonolithicPolicyStudent(obs_dim=obs.shape[1], act_dim=act.shape[1]).to(device)
-    student.normalizer.update(torch.from_numpy(obs).float().to(device))
+    student.normalizer.update(tr_obs)
 
     optim = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.MSELoss()
@@ -162,36 +159,45 @@ def train_bc(
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
 
+    n_tr = tr_obs.shape[0]
+    n_val = val_obs.shape[0]
+    batches_per_epoch = max(1, n_tr // cfg.batch_size)
+    print(f"[bc] train={n_tr} val={n_val} batches/epoch={batches_per_epoch} batch_size={cfg.batch_size}", flush=True)
+
     best_val = float("inf")
-    global_step = 0
     t_start = time.time()
     ewma_epoch_s: Optional[float] = None
     for epoch in range(cfg.epochs):
         t_epoch_start = time.time()
         student.train()
-        running = 0.0
-        seen = 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        epoch_loss_sum = torch.zeros((), device=device)
+        epoch_seen = 0
+        for _ in range(batches_per_epoch):
+            if sampler_weights is not None:
+                idx = torch.multinomial(sampler_weights, cfg.batch_size, replacement=True)
+            else:
+                idx = torch.randint(0, n_tr, (cfg.batch_size,), device=device)
+            x = tr_obs[idx]
+            y = tr_act[idx]
             pred = student(x)
             loss = loss_fn(pred, y)
             optim.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
             optim.step()
-            running += float(loss.item()) * x.shape[0]
-            seen += x.shape[0]
-            global_step += 1
-        train_loss = running / max(1, seen)
+            epoch_loss_sum = epoch_loss_sum + loss.detach() * cfg.batch_size
+            epoch_seen += cfg.batch_size
+        train_loss = (epoch_loss_sum / max(1, epoch_seen)).item()
 
         student.eval()
         with torch.no_grad():
-            v_run, v_seen = 0.0, 0
-            for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                v_run += float(loss_fn(student(x), y).item()) * x.shape[0]
-                v_seen += x.shape[0]
-            val_loss = v_run / max(1, v_seen)
+            v_sum = torch.zeros((), device=device)
+            v_seen = 0
+            for s in range(0, n_val, cfg.batch_size):
+                e = min(s + cfg.batch_size, n_val)
+                v_sum = v_sum + loss_fn(student(val_obs[s:e]), val_act[s:e]) * (e - s)
+                v_seen += (e - s)
+            val_loss = (v_sum / max(1, v_seen)).item()
 
         epoch_s = time.time() - t_epoch_start
         ewma_epoch_s = epoch_s if ewma_epoch_s is None else 0.9 * ewma_epoch_s + 0.1 * epoch_s

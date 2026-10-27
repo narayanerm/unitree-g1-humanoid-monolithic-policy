@@ -623,17 +623,20 @@ def ppo_finetune(
         done_buf = torch.zeros(T, N, device=device)
         val_buf = torch.zeros(T, N, device=device)
 
-        iter_env_rew = 0.0
-        iter_mimic_rew = 0.0
-        iter_walk_shape = 0.0
-        iter_carry_shape = 0.0
-        iter_drop_shape = 0.0
-        iter_success_rew = 0.0
-        iter_pick_fires = 0
-        iter_carry_fires = 0
-        iter_drop_fires = 0
-        iter_drops_done = 0
-        iter_falls = 0
+        # Accumulate stats on-device so each rollout step only costs one add,
+        # not a CUDA sync per metric. Items are moved to Python once per iter
+        # in the logging block below.
+        iter_env_rew_t = torch.zeros((), device=device)
+        iter_mimic_rew_t = torch.zeros((), device=device)
+        iter_walk_shape_t = torch.zeros((), device=device)
+        iter_carry_shape_t = torch.zeros((), device=device)
+        iter_drop_shape_t = torch.zeros((), device=device)
+        iter_success_rew_t = torch.zeros((), device=device)
+        iter_pick_fires_t = torch.zeros((), dtype=torch.long, device=device)
+        iter_carry_fires_t = torch.zeros((), dtype=torch.long, device=device)
+        iter_drop_fires_t = torch.zeros((), dtype=torch.long, device=device)
+        iter_drops_done_t = torch.zeros((), dtype=torch.long, device=device)
+        iter_falls_t = torch.zeros((), dtype=torch.long, device=device)
 
         for t in range(T):
             unified = _unified_obs_per_env(base_env, state.phase_ids, goal, last_action)
@@ -644,10 +647,10 @@ def ppo_finetune(
 
             # Advance phase before stepping so the recorded phase matches the action's intent.
             fires = _advance_phases_full(base_env, state, table1_world_xy, table2_world_xy, cfg, rollout_cfg)
-            iter_pick_fires += int(fires["pick_fires"].sum())
-            iter_carry_fires += int(fires["carry_fires"].sum())
-            iter_drop_fires += int(fires["drop_fires"].sum())
-            iter_drops_done += int(fires["new_drop_done"].sum())
+            iter_pick_fires_t = iter_pick_fires_t + fires["pick_fires"].sum()
+            iter_carry_fires_t = iter_carry_fires_t + fires["carry_fires"].sum()
+            iter_drop_fires_t = iter_drop_fires_t + fires["drop_fires"].sum()
+            iter_drops_done_t = iter_drops_done_t + fires["new_drop_done"].sum()
             if fires["pick_fires"].any():
                 _snap_pick_commands_batched(
                     base_env, env_ids=fires["pick_fires"].nonzero(as_tuple=False).squeeze(-1),
@@ -682,7 +685,7 @@ def ppo_finetune(
             timeout = ep_step >= cfg.episode_max_steps
             terminated_any = fell | succeeded | timeout
             fall_pen = -cfg.fall_penalty * fell.float()
-            iter_falls += int(fell.sum())
+            iter_falls_t = iter_falls_t + fell.sum()
             surv = cfg.survival_coef * torch.ones_like(env_rew)
 
             step_rew = env_rew + walk_shape + carry_shape + drop_shape + success_rew + mimic_rew + fall_pen + surv
@@ -694,12 +697,12 @@ def ppo_finetune(
             done_buf[t] = terminated_any.float()
             val_buf[t] = value
 
-            iter_env_rew += float(env_rew.mean().item())
-            iter_mimic_rew += float(mimic_rew.mean().item())
-            iter_walk_shape += float(walk_shape.mean().item())
-            iter_carry_shape += float(carry_shape.mean().item())
-            iter_drop_shape += float(drop_shape.mean().item())
-            iter_success_rew += float(success_rew.mean().item())
+            iter_env_rew_t = iter_env_rew_t + env_rew.mean()
+            iter_mimic_rew_t = iter_mimic_rew_t + mimic_rew.mean()
+            iter_walk_shape_t = iter_walk_shape_t + walk_shape.mean()
+            iter_carry_shape_t = iter_carry_shape_t + carry_shape.mean()
+            iter_drop_shape_t = iter_drop_shape_t + drop_shape.mean()
+            iter_success_rew_t = iter_success_rew_t + success_rew.mean()
 
             if terminated_any.any():
                 done_ids = terminated_any.nonzero(as_tuple=False).squeeze(-1).to(torch.long)
@@ -732,12 +735,13 @@ def ppo_finetune(
             flat_obs = obs_buf.reshape(-1, UNIFIED_OBS_DIM)
             critic.normalizer.update(flat_obs)
 
-        # PPO update.
-        approx_kl_sum = 0.0
-        policy_loss_sum = 0.0
-        value_loss_sum = 0.0
-        entropy_sum = 0.0
-        kl_prior_sum = 0.0
+        # PPO update. Loss accumulators are on-device to avoid per-minibatch
+        # CUDA syncs; totalled once at the end of the iter.
+        approx_kl_sum_t = torch.zeros((), device=device)
+        policy_loss_sum_t = torch.zeros((), device=device)
+        value_loss_sum_t = torch.zeros((), device=device)
+        entropy_sum_t = torch.zeros((), device=device)
+        kl_prior_sum_t = torch.zeros((), device=device)
         n_updates = 0
 
         for obs_mb, act_mb, old_logp, ret_mb, adv_mb in buf.iterate(cfg.num_mini_batches, cfg.num_learning_epochs):
@@ -771,15 +775,36 @@ def ppo_finetune(
             optim.step()
 
             with torch.no_grad():
-                approx_kl_sum += float((old_logp - new_logp).mean().item())
-            policy_loss_sum += float(policy_loss.item())
-            value_loss_sum += float(value_loss.item())
-            entropy_sum += float(entropy.mean().item())
-            kl_prior_sum += float(kl_prior.item())
+                approx_kl_sum_t = approx_kl_sum_t + (old_logp - new_logp).mean()
+            policy_loss_sum_t = policy_loss_sum_t + policy_loss.detach()
+            value_loss_sum_t = value_loss_sum_t + value_loss.detach()
+            entropy_sum_t = entropy_sum_t + entropy.mean().detach()
+            kl_prior_sum_t = kl_prior_sum_t + kl_prior.detach()
             n_updates += 1
 
+        # One-shot sync for all iter stats (replaces ~250 .item() per iter).
+        inv_n = 1.0 / max(1, n_updates)
+        inv_T = 1.0 / max(1, T)
+        mean_step_rew = rew_buf.mean().item()
+        mean_kl = (approx_kl_sum_t * inv_n).item()
+        policy_loss_mean = (policy_loss_sum_t * inv_n).item()
+        value_loss_mean = (value_loss_sum_t * inv_n).item()
+        entropy_mean = (entropy_sum_t * inv_n).item()
+        kl_prior_mean = (kl_prior_sum_t * inv_n).item()
+        iter_env_rew = (iter_env_rew_t * inv_T).item()
+        iter_mimic_rew = (iter_mimic_rew_t * inv_T).item()
+        iter_walk_shape = (iter_walk_shape_t * inv_T).item()
+        iter_carry_shape = (iter_carry_shape_t * inv_T).item()
+        iter_drop_shape = (iter_drop_shape_t * inv_T).item()
+        iter_success_rew = (iter_success_rew_t * inv_T).item()
+        iter_pick_fires = int(iter_pick_fires_t.item())
+        iter_carry_fires = int(iter_carry_fires_t.item())
+        iter_drop_fires = int(iter_drop_fires_t.item())
+        iter_drops_done = int(iter_drops_done_t.item())
+        iter_falls = int(iter_falls_t.item())
+        mean_std = actor.log_std.exp().mean().item()
+
         # Adaptive LR matching rsl-rl's schedule on desired_kl.
-        mean_kl = approx_kl_sum / max(1, n_updates)
         if mean_kl > 2.0 * cfg.desired_kl:
             lr = max(1e-5, lr / 1.5)
         elif mean_kl < 0.5 * cfg.desired_kl and mean_kl > 0:
@@ -794,27 +819,25 @@ def ppo_finetune(
         remaining_iters = cfg.max_iterations - it - 1
         eta_s = remaining_iters * ewma_iter_s
 
-        # Logging.
-        mean_step_rew = rew_buf.mean().item()
         writer.add_scalar("Train/mean_reward_total", mean_step_rew, it)
-        writer.add_scalar("Train/mean_reward_env", iter_env_rew / T, it)
-        writer.add_scalar("Train/mean_reward_mimic", iter_mimic_rew / T, it)
-        writer.add_scalar("Train/mean_reward_walk_shape", iter_walk_shape / T, it)
-        writer.add_scalar("Train/mean_reward_carry_shape", iter_carry_shape / T, it)
-        writer.add_scalar("Train/mean_reward_drop_shape", iter_drop_shape / T, it)
-        writer.add_scalar("Train/mean_reward_success", iter_success_rew / T, it)
+        writer.add_scalar("Train/mean_reward_env", iter_env_rew, it)
+        writer.add_scalar("Train/mean_reward_mimic", iter_mimic_rew, it)
+        writer.add_scalar("Train/mean_reward_walk_shape", iter_walk_shape, it)
+        writer.add_scalar("Train/mean_reward_carry_shape", iter_carry_shape, it)
+        writer.add_scalar("Train/mean_reward_drop_shape", iter_drop_shape, it)
+        writer.add_scalar("Train/mean_reward_success", iter_success_rew, it)
         writer.add_scalar("Train/pick_fires_per_iter", iter_pick_fires, it)
         writer.add_scalar("Train/carry_fires_per_iter", iter_carry_fires, it)
         writer.add_scalar("Train/drop_fires_per_iter", iter_drop_fires, it)
         writer.add_scalar("Train/drops_done_per_iter", iter_drops_done, it)
         writer.add_scalar("Train/falls_per_iter", iter_falls, it)
         writer.add_scalar("Train/learning_rate", lr, it)
-        writer.add_scalar("Loss/policy", policy_loss_sum / n_updates, it)
-        writer.add_scalar("Loss/value", value_loss_sum / n_updates, it)
-        writer.add_scalar("Loss/entropy", entropy_sum / n_updates, it)
-        writer.add_scalar("Loss/kl_to_prior", kl_prior_sum / n_updates, it)
+        writer.add_scalar("Loss/policy", policy_loss_mean, it)
+        writer.add_scalar("Loss/value", value_loss_mean, it)
+        writer.add_scalar("Loss/entropy", entropy_mean, it)
+        writer.add_scalar("Loss/kl_to_prior", kl_prior_mean, it)
         writer.add_scalar("Loss/approx_kl", mean_kl, it)
-        writer.add_scalar("Policy/mean_std", actor.log_std.exp().mean().item(), it)
+        writer.add_scalar("Policy/mean_std", mean_std, it)
         writer.add_scalar("Perf/iter_s", iter_s, it)
         writer.add_scalar("Perf/elapsed_s", elapsed_s, it)
         writer.add_scalar("Perf/eta_s", eta_s, it)
@@ -822,11 +845,11 @@ def ppo_finetune(
         if (it % cfg.log_interval) == 0:
             print(
                 f"[ppo] iter {it:4d}/{cfg.max_iterations} | r={mean_step_rew:+.3f} "
-                f"env={iter_env_rew / T:+.3f} mim={iter_mimic_rew / T:+.3f} "
-                f"wlk={iter_walk_shape / T:+.3f} car={iter_carry_shape / T:+.3f} drp={iter_drop_shape / T:+.3f} "
-                f"suc={iter_success_rew / T:+.3f} | P={iter_pick_fires} C={iter_carry_fires} D={iter_drop_fires} "
+                f"env={iter_env_rew:+.3f} mim={iter_mimic_rew:+.3f} "
+                f"wlk={iter_walk_shape:+.3f} car={iter_carry_shape:+.3f} drp={iter_drop_shape:+.3f} "
+                f"suc={iter_success_rew:+.3f} | P={iter_pick_fires} C={iter_carry_fires} D={iter_drop_fires} "
                 f"done={iter_drops_done} falls={iter_falls} | kl={mean_kl:.4f} "
-                f"std={actor.log_std.exp().mean().item():.3f} lr={lr:.1e} "
+                f"std={mean_std:.3f} lr={lr:.1e} "
                 f"| iter_s={iter_s:.1f} elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}"
             )
 
