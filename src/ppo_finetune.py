@@ -3,7 +3,7 @@
 # Developer  : Narayane Ribeiro Medeiros                                                 #
 # Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
-"""BeyondMimic-style PPO fine-tune of the unified student.
+"""BeyondMimic-style PPO fine-tune of the full-chain walk-pick-carry-drop student.
 
 Pipeline:
 1. Load the BC-trained ``MonolithicPolicyStudent`` as warm-start.
@@ -13,16 +13,21 @@ Pipeline:
    action-mimic reward: the two BeyondMimic-style regularisers that keep the
    policy from drifting out of the demonstration manifold while PPO exploits
    the task reward.
-4. Reset each env in the walk annulus with a fresh goal, roll out walk then pick
-   under the same brake predicates as ``fsm_continuous_batch``, and train with a
-   from-scratch MLP critic on the composite reward.
+4. Scene has table 1 (pickup) and table 2 (drop) per env — the same two-table
+   layout the FSM builds for data gen. The policy drives all four phases
+   (walk/pick/carry/drop); phase_ids are updated by physics-based gates so the
+   student receives the correct one-hot in its observation.
 
 Reward layout (per step):
 - env reward: the pick task's native reward manager (grasp, lift, stability).
-- walk shaping: w_walk times the previous-minus-current distance to the box; zero in pick phase.
-- mimic reward: negative w_mimic times squared L2 between the policy action and the BC action.
-- survival: w_surv until the robot falls; -fall_penalty on fall.
+- walk shaping: w_walk * in_walk * (prev_dist_box - dist_box).
+- carry shaping: w_carry * in_carry * (prev_dist_approach - dist_approach).
+- drop shaping: w_drop * in_drop * (prev_box_z - box_z) — reward lowering the box.
+- success bonus: +drop_success_bonus one-shot when box_z <= drop_z_done & box_on_t2 & upright.
+- mimic reward: -w_mimic * MSE(action, bc_action).
+- survival + fall penalty as before.
 
+Episode ends on fall, drop_done (success), or timeout.
 Output: ``outputs/logs/g1_monolithic_ppo/<timestamp>/model_*.pt`` + TB scalars.
 """
 
@@ -47,6 +52,16 @@ from src.fsm_continuous_batch import (
     _snap_pick_commands_batched,
     _teleport_robot_batch,
     _unified_obs_per_env,
+)
+from src.fsm_wpcd_batched import (
+    CARRY_PHASE_ID,
+    DROP_PHASE_ID,
+    POST_DROP_PHASE_ID,
+    TABLE2_HALF_X,
+    TABLE2_HALF_Y,
+    _make_two_tables_spec_fn,
+    _resample_spawn_outside_t2,
+    _sample_table2_positions_np,
 )
 from src.goal_features import UNIFIED_ACT_DIM, UNIFIED_OBS_DIM, sample_goal
 from src.student_policy import MonolithicPolicyStudent
@@ -73,9 +88,15 @@ class PPOFinetuneConfig:
     num_envs: int = 2048
     num_steps_per_env: int = 24
     max_iterations: int = 1500
-    episode_max_steps: int = 400
-    spawn_r_min: float = 0.2
+    episode_max_steps: int = 1600
+    spawn_r_min: float = 1.5
     spawn_r_max: float = 5.0
+    env_spacing: float = 20.0
+
+    # Table 2 placement per env (matches fsm_wpcd_batched defaults).
+    table2_r_min: float = 1.5
+    table2_r_max: float = 5.0
+    spawn_t2_safety: float = 1.0
 
     learning_rate: float = 3e-4
     clip_param: float = 0.2
@@ -94,9 +115,24 @@ class PPOFinetuneConfig:
     initial_log_std: float = -2.3     # exp(-2.3) ~= 0.1; starts near-deterministic
     freeze_log_std_iters: int = 100
 
-    walk_distance_coef: float = 1.0   # reward for closing distance toward the box in walk
+    # Shaping / terminal reward.
+    walk_distance_coef: float = 1.0   # in_walk * (prev_dist_box - dist_box)
+    carry_shape_coef: float = 1.0     # in_carry * (prev_dist_approach - dist_approach)
+    drop_shape_coef: float = 2.0      # in_drop * (prev_box_z - box_z)
+    drop_success_bonus: float = 100.0 # one-shot when drop_done fires
     survival_coef: float = 0.01
     fall_penalty: float = 10.0
+
+    # Phase gate thresholds (mirror fsm_wpcd_batched).
+    walk_to_pick_dist: float = 0.55
+    walk_to_pick_brake_steps: int = 25
+    pick_to_carry_box_z: float = 0.85
+    pick_stable_counter_min: int = 10
+    pick_timeout_steps: int = 150
+    carry_arrival_dist: float = 0.20
+    carry_brake_steps: int = 60
+    drop_z_done: float = 0.72
+    pelvis_to_t2: float = 0.61
 
     critic_hidden: tuple[int, ...] = (512, 256, 128)
 
@@ -236,45 +272,179 @@ class RolloutBuffer:
                 yield obs[sel], actions[sel], log_probs[sel], returns[sel], advantages[sel]
 
 
-def _advance_phase(
+class _PhaseState:
+    """Mutable per-env book-keeping tensors used by _advance_phases_full."""
+
+    def __init__(self, num_envs: int, device: torch.device):
+        """Allocate zero tensors for every per-env counter and latched target.
+        Args: num_envs: parallel env count; device: torch device for all tensors.
+        Returns: none.
+        """
+        self.phase_ids = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.brake_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.pick_stable_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.in_pick_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.carry_brake_counter = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.approach_target_xy = torch.zeros(num_envs, 2, device=device)
+        self.place_target_pos_w = torch.zeros(num_envs, 3, device=device)
+        self.place_target_quat_w = torch.zeros(num_envs, 4, device=device)
+        self.place_target_quat_w[:, 0] = 1.0
+        self.object_target_pos_w = torch.zeros(num_envs, 3, device=device)
+        self.object_target_quat_w = torch.zeros(num_envs, 4, device=device)
+        self.object_target_quat_w[:, 0] = 1.0
+        self.drop_done_ever = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    def reset_envs(self, env_ids: torch.Tensor) -> None:
+        """Zero all per-env state for a subset of envs (used after reset/respawn).
+        Args: env_ids: 1-D long tensor of env indices to reset.
+        Returns: none.
+        """
+        if env_ids.numel() == 0:
+            return
+        self.phase_ids[env_ids] = WALK_PHASE_ID
+        self.brake_counter[env_ids] = 0
+        self.pick_stable_counter[env_ids] = 0
+        self.in_pick_counter[env_ids] = 0
+        self.carry_brake_counter[env_ids] = 0
+        self.approach_target_xy[env_ids] = 0.0
+        self.place_target_pos_w[env_ids] = 0.0
+        self.place_target_quat_w[env_ids] = 0.0
+        self.place_target_quat_w[env_ids, 0] = 1.0
+        self.object_target_pos_w[env_ids] = 0.0
+        self.object_target_quat_w[env_ids] = 0.0
+        self.object_target_quat_w[env_ids, 0] = 1.0
+        self.drop_done_ever[env_ids] = False
+
+
+def _advance_phases_full(
     base_env,
-    phase_ids: torch.Tensor,
-    brake_counter: torch.Tensor,
-    cfg: RolloutConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Promote envs from walk to pick when the brake predicates fire.
-    Args: base_env: mjlab env; phase_ids: (N,) current phases; brake_counter: (N,) per-env brake frames; cfg: RolloutConfig thresholds.
-    Returns: (phase_ids_updated, brake_counter_updated, fires_mask).
+    state: _PhaseState,
+    table1_world_xy: torch.Tensor,
+    table2_world_xy: torch.Tensor,
+    cfg: PPOFinetuneConfig,
+    rollout_cfg: RolloutConfig,
+) -> dict:
+    """Update per-env phase ids through walk-pick-carry-drop using physics gates.
+    Args: base_env: mjlab env; state: _PhaseState with mutable per-env tensors; table1_world_xy / table2_world_xy: (N, 2) world positions used for distance gates and target locking; cfg: PPOFinetuneConfig thresholds; rollout_cfg: shared RolloutConfig (upright_min, pick velocity caps, etc.).
+    Returns: dict with 'pick_fires', 'carry_fires', 'drop_fires', 'drop_done' boolean masks (N,) for the current step.
     """
     robot = base_env.scene["robot"]
     box = base_env.scene["box"]
+
     up_align = -robot.data.projected_gravity_b[:, 2]
-    upright = up_align > cfg.upright_min
-    dxy = box.data.root_link_pos_w[:, :2] - robot.data.root_link_pos_w[:, :2]
-    dist = torch.linalg.norm(dxy, dim=-1)
+    upright = up_align > rollout_cfg.upright_min
+    root_pos_xy = robot.data.root_link_pos_w[:, :2]
+    box_pos_w = box.data.root_link_pos_w
+    box_z = box_pos_w[:, 2]
+    dxy_box = box_pos_w[:, :2] - root_pos_xy
+    dist_box = torch.linalg.norm(dxy_box, dim=-1)
     base_vx = robot.data.root_link_lin_vel_b[:, 0].abs()
     base_wz = robot.data.root_link_ang_vel_b[:, 2].abs()
     r_quat = robot.data.root_link_quat_w
     r_w, r_xq, r_yq, r_zq = r_quat.unbind(-1)
     r_yaw = torch.atan2(2 * (r_w * r_zq + r_xq * r_yq), 1 - 2 * (r_yq * r_yq + r_zq * r_zq))
-    box_dir = torch.atan2(dxy[:, 1], dxy[:, 0])
-    heading_err = torch.atan2(torch.sin(box_dir - r_yaw), torch.cos(box_dir - r_yaw))
+    box_dir = torch.atan2(dxy_box[:, 1], dxy_box[:, 0])
+    heading_err_box = torch.atan2(torch.sin(box_dir - r_yaw), torch.cos(box_dir - r_yaw))
+    box_v = box.data.root_link_lin_vel_w.norm(dim=-1)
 
-    in_walk = phase_ids == WALK_PHASE_ID
-    entered_brake = in_walk & (dist <= cfg.walk_to_pick_dist)
-    brake_mask = in_walk & (entered_brake | (brake_counter > 0))
-    brake_counter = torch.where(brake_mask, brake_counter + 1, torch.zeros_like(brake_counter))
+    in_walk = state.phase_ids == WALK_PHASE_ID
+    in_pick = state.phase_ids == PICK_PHASE_ID
+    in_carry = state.phase_ids == CARRY_PHASE_ID
+    in_drop = state.phase_ids == DROP_PHASE_ID
 
-    fires = (
+    # Walk -> Pick.
+    entered_brake = in_walk & (dist_box <= cfg.walk_to_pick_dist)
+    brake_mask = in_walk & (entered_brake | (state.brake_counter > 0))
+    state.brake_counter = torch.where(brake_mask, state.brake_counter + 1, torch.zeros_like(state.brake_counter))
+    pick_fires = (
         in_walk & upright
-        & (dist <= cfg.walk_to_pick_dist)
-        & (base_vx < cfg.walk_to_pick_speed_max)
-        & (base_wz < cfg.walk_to_pick_wz_max)
-        & (heading_err.abs() < cfg.walk_to_pick_heading_err_max)
-        & (brake_counter >= cfg.walk_to_pick_brake_steps)
+        & (dist_box <= cfg.walk_to_pick_dist)
+        & (base_vx < rollout_cfg.walk_to_pick_speed_max)
+        & (base_wz < rollout_cfg.walk_to_pick_wz_max)
+        & (heading_err_box.abs() < rollout_cfg.walk_to_pick_heading_err_max)
+        & (state.brake_counter >= cfg.walk_to_pick_brake_steps)
     )
-    phase_ids = torch.where(fires, torch.full_like(phase_ids, PICK_PHASE_ID), phase_ids)
-    return phase_ids, brake_counter, fires
+
+    # Pick -> Carry (relaxed thresholds + timeout, matches fsm_wpcd iter5+).
+    pick_stable = (
+        in_pick
+        & (box_z > cfg.pick_to_carry_box_z)
+        & upright
+        & (base_vx < 0.15) & (base_wz < 0.25) & (box_v < 0.30)
+    )
+    state.pick_stable_counter = torch.where(
+        pick_stable, state.pick_stable_counter + 1, torch.zeros_like(state.pick_stable_counter),
+    )
+    state.in_pick_counter = torch.where(in_pick, state.in_pick_counter + 1, torch.zeros_like(state.in_pick_counter))
+    pick_timeout = in_pick & upright & (box_z > cfg.pick_to_carry_box_z) & (state.in_pick_counter >= cfg.pick_timeout_steps)
+    carry_fires = in_pick & ((pick_stable & (state.pick_stable_counter >= cfg.pick_stable_counter_min)) | pick_timeout)
+
+    # Lock approach target on carry_fire: cardinal snap toward t1 side of t2 (iter6).
+    if carry_fires.any():
+        dxy_t1_t2 = table1_world_xy - table2_world_xy
+        abs_x = dxy_t1_t2[:, 0].abs()
+        abs_y = dxy_t1_t2[:, 1].abs()
+        on_x_axis = abs_x >= abs_y
+        outward_x = torch.where(on_x_axis, torch.sign(dxy_t1_t2[:, 0]), torch.zeros_like(dxy_t1_t2[:, 0]))
+        outward_y = torch.where(on_x_axis, torch.zeros_like(dxy_t1_t2[:, 1]), torch.sign(dxy_t1_t2[:, 1]))
+        new_approach_x = table2_world_xy[:, 0] + outward_x * cfg.pelvis_to_t2
+        new_approach_y = table2_world_xy[:, 1] + outward_y * cfg.pelvis_to_t2
+        state.approach_target_xy[:, 0] = torch.where(carry_fires, new_approach_x, state.approach_target_xy[:, 0])
+        state.approach_target_xy[:, 1] = torch.where(carry_fires, new_approach_y, state.approach_target_xy[:, 1])
+
+    # Carry -> Drop gates.
+    t2_dir_all = table2_world_xy - root_pos_xy
+    t2_ang_all = torch.atan2(t2_dir_all[:, 1], t2_dir_all[:, 0])
+    heading_err_t2 = torch.atan2(torch.sin(t2_ang_all - r_yaw), torch.cos(t2_ang_all - r_yaw))
+    dist_approach = torch.linalg.norm(state.approach_target_xy - root_pos_xy, dim=-1)
+    near_t2 = in_carry & (dist_approach <= cfg.carry_arrival_dist)
+    state.carry_brake_counter = torch.where(
+        near_t2, state.carry_brake_counter + 1, torch.zeros_like(state.carry_brake_counter),
+    )
+    drop_fires = (
+        in_carry & near_t2 & upright
+        & (box_z > cfg.pick_to_carry_box_z - 0.1)
+        & (base_vx < 0.12) & (base_wz < 0.35)
+        & (heading_err_t2.abs() < 0.10)
+        & (state.carry_brake_counter >= cfg.carry_brake_steps)
+    )
+
+    # Lock place_target on drop_fire: pos at t2 center, quat snapped to robot yaw (iter7).
+    if drop_fires.any():
+        fire_mask = drop_fires
+        state.place_target_pos_w[:, 0] = torch.where(fire_mask, table2_world_xy[:, 0], state.place_target_pos_w[:, 0])
+        state.place_target_pos_w[:, 1] = torch.where(fire_mask, table2_world_xy[:, 1], state.place_target_pos_w[:, 1])
+        half_r = r_yaw / 2
+        zero_r = torch.zeros_like(half_r)
+        yaw_quat_robot = torch.stack([torch.cos(half_r), zero_r, zero_r, torch.sin(half_r)], dim=-1)
+        state.place_target_quat_w[:] = torch.where(fire_mask.unsqueeze(-1), yaw_quat_robot, state.place_target_quat_w)
+        state.object_target_pos_w[:] = torch.where(fire_mask.unsqueeze(-1), box_pos_w, state.object_target_pos_w)
+        cur_box_quat = box.data.root_link_quat_w
+        state.object_target_quat_w[:] = torch.where(fire_mask.unsqueeze(-1), cur_box_quat, state.object_target_quat_w)
+
+    # Drop -> Done (success).
+    box_xy_rel_t2 = (box_pos_w[:, :2] - table2_world_xy).abs()
+    box_on_t2 = (box_xy_rel_t2[:, 0] <= TABLE2_HALF_X) & (box_xy_rel_t2[:, 1] <= TABLE2_HALF_Y)
+    drop_done = in_drop & (box_z <= cfg.drop_z_done) & upright & box_on_t2
+    new_drop_done = drop_done & ~state.drop_done_ever
+
+    # Commit phase transitions.
+    state.phase_ids = torch.where(pick_fires, torch.full_like(state.phase_ids, PICK_PHASE_ID), state.phase_ids)
+    state.phase_ids = torch.where(carry_fires, torch.full_like(state.phase_ids, CARRY_PHASE_ID), state.phase_ids)
+    state.phase_ids = torch.where(drop_fires, torch.full_like(state.phase_ids, DROP_PHASE_ID), state.phase_ids)
+    state.phase_ids = torch.where(drop_done, torch.full_like(state.phase_ids, POST_DROP_PHASE_ID), state.phase_ids)
+    state.drop_done_ever = state.drop_done_ever | drop_done
+
+    return {
+        "pick_fires": pick_fires,
+        "carry_fires": carry_fires,
+        "drop_fires": drop_fires,
+        "drop_done": drop_done,
+        "new_drop_done": new_drop_done,
+        "dist_box": dist_box,
+        "dist_approach": dist_approach,
+        "box_z": box_z,
+    }
 
 
 def _distance_to_box(base_env) -> torch.Tensor:
@@ -293,18 +463,26 @@ def _teleport_done_envs(
     done_ids: torch.Tensor,
     cfg: PPOFinetuneConfig,
     seed_offset: int,
+    table2_world_xy: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Teleport the robots of ``done_ids`` to a fresh annulus spawn and return (xy, yaw) for logging.
-    Args: base_env: mjlab env; done_ids: 1-D long tensor of env indices to respawn; cfg: finetune config; seed_offset: integer to shift the per-reset seed so successive resets don't collide.
+    """Teleport the robots of ``done_ids`` to a fresh annulus spawn, rejection-sampling positions near table 2 when provided, and return (xy, yaw) for logging.
+    Args: base_env: mjlab env; done_ids: 1-D long tensor of env indices to respawn; cfg: finetune config; seed_offset: integer to shift the per-reset seed so successive resets don't collide; table2_world_xy: (num_envs, 2) world positions of each env's table 2, used to reject spawns too close.
     Returns: (spawn_xy, spawn_yaw) tensors for the respawned envs.
     """
     device = base_env.scene["robot"].data.root_link_pos_w.device
     n = int(done_ids.numel())
     box_xy_all = base_env.scene["box"].data.root_link_pos_w[:, :2]
     box_xy = box_xy_all[done_ids]
+    reset_seed = cfg.seed ^ (seed_offset * 7919)
     spawn_xy, spawn_yaw = _random_spawn_annulus(
-        box_xy, cfg.spawn_r_min, cfg.spawn_r_max, cfg.seed ^ (seed_offset * 7919), device,
+        box_xy, cfg.spawn_r_min, cfg.spawn_r_max, reset_seed, device,
     )
+    if table2_world_xy is not None:
+        spawn_xy = _resample_spawn_outside_t2(
+            spawn_xy, box_xy, table2_world_xy[done_ids],
+            r_min=cfg.spawn_r_min, r_max=cfg.spawn_r_max,
+            safety=cfg.spawn_t2_safety, seed=reset_seed, device=device,
+        )
     spawn_z = torch.full((n,), 0.78, device=device)
     # Compose a full-batch pose with no-op entries for untouched envs; mjlab's writer expects full-batch tensors when env_ids is given.
     robot = base_env.scene["robot"]
@@ -353,16 +531,25 @@ def ppo_finetune(
     torch.cuda.manual_seed_all(int(cfg.seed))
     np.random.seed(int(cfg.seed))
 
-    # Env setup: pick scene with the extended episode length (walk + pick fits in max_steps).
+    # Env setup: pick scene with table 2 added per env (walk+pick+carry+drop chain).
     register_pick()
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = cfg.num_envs
+    env_cfg.scene.env_spacing = cfg.env_spacing
+    table2_rel_xy_np = _sample_table2_positions_np(cfg.num_envs, cfg.table2_r_min, cfg.table2_r_max, cfg.seed)
+    env_cfg.scene.spec_fn = _make_two_tables_spec_fn(cfg.num_envs, cfg.env_spacing, table2_rel_xy_np)
     _disable_terminations(env_cfg)
     env_cfg.episode_length_s = float(cfg.episode_max_steps) * env_cfg.sim.mujoco.timestep * env_cfg.decimation
     agent_cfg = load_rl_cfg(PICK_TASK_ID)
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=None)
     env = RslRlVecEnvWrapper(base_env, clip_actions=cfg.clip_actions)
     _ = env.get_observations()
+
+    # Per-env table 1 (box spawn location, origin + offset) and table 2 world positions.
+    origins_t = base_env.scene.env_origins[:, :2]
+    table1_world_xy = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
+    table2_rel_torch = torch.from_numpy(table2_rel_xy_np).to(device)
+    table2_world_xy = origins_t + table2_rel_torch
 
     # Actor warm-start + frozen BC prior for the mimic reward / KL penalty.
     student = MonolithicPolicyStudent.load(str(bc_ckpt), device=device)
@@ -399,15 +586,21 @@ def ppo_finetune(
         print(f"[ppo] resumed from {resume_ckpt} at iteration {start_iter}")
 
     # Initial spawn + goal per env.
-    phase_ids = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
-    brake_counter = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
+    state = _PhaseState(cfg.num_envs, device)
     last_action = torch.zeros(cfg.num_envs, UNIFIED_ACT_DIM, device=device)
     goal = sample_goal(cfg.num_envs, device=device, seed=cfg.seed)
     all_ids = torch.arange(cfg.num_envs, device=device, dtype=torch.long)
-    _teleport_done_envs(base_env, all_ids, cfg, seed_offset=0)
+    _teleport_done_envs(base_env, all_ids, cfg, seed_offset=0, table2_world_xy=table2_world_xy)
     env.step(torch.zeros(cfg.num_envs, UNIFIED_ACT_DIM, device=device))
     _snap_pick_commands_batched(base_env)
-    prev_dist = _distance_to_box(base_env)
+    # Previous-step distances/heights for shaping deltas.
+    prev_dist_box = _distance_to_box(base_env)
+    prev_dist_approach = torch.linalg.norm(
+        state.approach_target_xy - base_env.scene["robot"].data.root_link_pos_w[:, :2], dim=-1,
+    )
+    prev_box_z = base_env.scene["box"].data.root_link_pos_w[:, 2]
+    # Per-env episode step counter for timeout check (independent of mjlab's).
+    ep_step = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
 
     reset_counter = 1
     t_start = time.time()
@@ -429,81 +622,111 @@ def ppo_finetune(
 
         iter_env_rew = 0.0
         iter_mimic_rew = 0.0
-        iter_shape_rew = 0.0
+        iter_walk_shape = 0.0
+        iter_carry_shape = 0.0
+        iter_drop_shape = 0.0
+        iter_success_rew = 0.0
         iter_pick_fires = 0
+        iter_carry_fires = 0
+        iter_drop_fires = 0
+        iter_drops_done = 0
         iter_falls = 0
 
         for t in range(T):
-            unified = _unified_obs_per_env(base_env, phase_ids, goal, last_action)
+            unified = _unified_obs_per_env(base_env, state.phase_ids, goal, last_action)
             with torch.no_grad():
                 action, log_prob = actor.act(unified)
                 value = critic(unified)
                 bc_action = bc_prior(unified)
 
             # Advance phase before stepping so the recorded phase matches the action's intent.
-            phase_ids_next, brake_counter, fires = _advance_phase(
-                base_env, phase_ids, brake_counter, rollout_cfg,
-            )
-            if fires.any():
-                iter_pick_fires += int(fires.sum())
-                _snap_pick_commands_batched(base_env, env_ids=fires.nonzero(as_tuple=False).squeeze(-1))
-            phase_ids = phase_ids_next
+            fires = _advance_phases_full(base_env, state, table1_world_xy, table2_world_xy, cfg, rollout_cfg)
+            iter_pick_fires += int(fires["pick_fires"].sum())
+            iter_carry_fires += int(fires["carry_fires"].sum())
+            iter_drop_fires += int(fires["drop_fires"].sum())
+            iter_drops_done += int(fires["new_drop_done"].sum())
+            if fires["pick_fires"].any():
+                _snap_pick_commands_batched(
+                    base_env, env_ids=fires["pick_fires"].nonzero(as_tuple=False).squeeze(-1),
+                )
 
             _, env_rew, done, extras = env.step(action)
             last_action = action.detach()
+            ep_step += 1
 
-            dist_now = _distance_to_box(base_env)
-            in_walk = (phase_ids == WALK_PHASE_ID).float()
-            shape_rew = cfg.walk_distance_coef * in_walk * (prev_dist - dist_now)
-            prev_dist = dist_now
+            # Phase-specific shape rewards (deltas from previous step).
+            cur_dist_box = fires["dist_box"]
+            cur_dist_approach = fires["dist_approach"]
+            cur_box_z = fires["box_z"]
+            in_walk_f = (state.phase_ids == WALK_PHASE_ID).float()
+            in_carry_f = (state.phase_ids == CARRY_PHASE_ID).float()
+            in_drop_f = (state.phase_ids == DROP_PHASE_ID).float()
+            walk_shape = cfg.walk_distance_coef * in_walk_f * (prev_dist_box - cur_dist_box)
+            carry_shape = cfg.carry_shape_coef * in_carry_f * (prev_dist_approach - cur_dist_approach)
+            drop_shape = cfg.drop_shape_coef * in_drop_f * (prev_box_z - cur_box_z)
+            prev_dist_box = cur_dist_box
+            prev_dist_approach = cur_dist_approach
+            prev_box_z = cur_box_z
+
+            # One-shot terminal bonus the step drop_done fires (only first time per episode).
+            success_rew = cfg.drop_success_bonus * fires["new_drop_done"].float()
 
             mimic_rew = -cfg.mimic_coef * ((action - bc_action) ** 2).mean(dim=-1)
 
-            # Fall penalty on steps the pick env marks terminated by fell_over; survival bonus otherwise.
-            terminated = done.bool() & ~extras.get("time_outs", torch.zeros_like(done).bool())
-            fall_pen = -cfg.fall_penalty * terminated.float()
-            iter_falls += int(terminated.sum())
+            # Episode terminations: fall (from env), drop_done (success), timeout.
+            fell = done.bool() & ~extras.get("time_outs", torch.zeros_like(done).bool())
+            succeeded = fires["new_drop_done"]
+            timeout = ep_step >= cfg.episode_max_steps
+            terminated_any = fell | succeeded | timeout
+            fall_pen = -cfg.fall_penalty * fell.float()
+            iter_falls += int(fell.sum())
             surv = cfg.survival_coef * torch.ones_like(env_rew)
 
-            step_rew = env_rew + shape_rew + mimic_rew + fall_pen + surv
+            step_rew = env_rew + walk_shape + carry_shape + drop_shape + success_rew + mimic_rew + fall_pen + surv
 
             obs_buf[t] = unified
             act_buf[t] = action
             logp_buf[t] = log_prob
             rew_buf[t] = step_rew
-            done_buf[t] = done.float()
+            done_buf[t] = terminated_any.float()
             val_buf[t] = value
 
             iter_env_rew += float(env_rew.mean().item())
             iter_mimic_rew += float(mimic_rew.mean().item())
-            iter_shape_rew += float(shape_rew.mean().item())
+            iter_walk_shape += float(walk_shape.mean().item())
+            iter_carry_shape += float(carry_shape.mean().item())
+            iter_drop_shape += float(drop_shape.mean().item())
+            iter_success_rew += float(success_rew.mean().item())
 
-            if done.any():
-                done_ids = done.nonzero(as_tuple=False).squeeze(-1).to(torch.long)
-                _teleport_done_envs(base_env, done_ids, cfg, seed_offset=reset_counter)
+            if terminated_any.any():
+                done_ids = terminated_any.nonzero(as_tuple=False).squeeze(-1).to(torch.long)
+                _teleport_done_envs(base_env, done_ids, cfg, seed_offset=reset_counter, table2_world_xy=table2_world_xy)
                 reset_counter += 1
-                phase_ids[done_ids] = WALK_PHASE_ID
-                brake_counter[done_ids] = 0
+                state.reset_envs(done_ids)
                 last_action[done_ids] = 0.0
+                ep_step[done_ids] = 0
                 # Resample goals only for the finished envs.
                 new_goal = sample_goal(int(done_ids.numel()), device=device, seed=cfg.seed + reset_counter)
                 for name in ("object_init_pos_w", "object_init_quat_w", "place_target_pos_w", "place_target_quat_w"):
                     tensor = getattr(goal, name)
                     tensor[done_ids] = getattr(new_goal, name)
-                prev_dist = _distance_to_box(base_env)
+                prev_dist_box = _distance_to_box(base_env)
+                prev_dist_approach = torch.linalg.norm(
+                    state.approach_target_xy - base_env.scene["robot"].data.root_link_pos_w[:, :2], dim=-1,
+                )
+                prev_box_z = base_env.scene["box"].data.root_link_pos_w[:, 2]
 
         # Bootstrap with the value of the final observation.
         with torch.no_grad():
-            final_unified = _unified_obs_per_env(base_env, phase_ids, goal, last_action)
+            final_unified = _unified_obs_per_env(base_env, state.phase_ids, goal, last_action)
             last_val = critic(final_unified)
 
         buf = RolloutBuffer(obs_buf, act_buf, logp_buf, rew_buf, done_buf, val_buf)
         buf.compute_gae(last_val, cfg.gamma, cfg.lam)
 
-        # Update normalisers on the fresh rollout.
+        # Keep actor normalizer frozen at the BC stats so cur_mean and prior_mean share the same input scale; critic updates its own.
         with torch.no_grad():
             flat_obs = obs_buf.reshape(-1, UNIFIED_OBS_DIM)
-            actor.student.normalizer.update(flat_obs)
             critic.normalizer.update(flat_obs)
 
         # PPO update.
@@ -573,8 +796,14 @@ def ppo_finetune(
         writer.add_scalar("Train/mean_reward_total", mean_step_rew, it)
         writer.add_scalar("Train/mean_reward_env", iter_env_rew / T, it)
         writer.add_scalar("Train/mean_reward_mimic", iter_mimic_rew / T, it)
-        writer.add_scalar("Train/mean_reward_shape", iter_shape_rew / T, it)
+        writer.add_scalar("Train/mean_reward_walk_shape", iter_walk_shape / T, it)
+        writer.add_scalar("Train/mean_reward_carry_shape", iter_carry_shape / T, it)
+        writer.add_scalar("Train/mean_reward_drop_shape", iter_drop_shape / T, it)
+        writer.add_scalar("Train/mean_reward_success", iter_success_rew / T, it)
         writer.add_scalar("Train/pick_fires_per_iter", iter_pick_fires, it)
+        writer.add_scalar("Train/carry_fires_per_iter", iter_carry_fires, it)
+        writer.add_scalar("Train/drop_fires_per_iter", iter_drop_fires, it)
+        writer.add_scalar("Train/drops_done_per_iter", iter_drops_done, it)
         writer.add_scalar("Train/falls_per_iter", iter_falls, it)
         writer.add_scalar("Train/learning_rate", lr, it)
         writer.add_scalar("Loss/policy", policy_loss_sum / n_updates, it)
@@ -589,10 +818,12 @@ def ppo_finetune(
 
         if (it % cfg.log_interval) == 0:
             print(
-                f"[ppo] iter {it:4d}/{cfg.max_iterations} | r_total={mean_step_rew:+.3f} "
-                f"r_env={iter_env_rew / T:+.3f} r_mim={iter_mimic_rew / T:+.3f} "
-                f"r_shp={iter_shape_rew / T:+.3f} | fires={iter_pick_fires} falls={iter_falls} "
-                f"| kl={mean_kl:.4f} std={actor.log_std.exp().mean().item():.3f} lr={lr:.1e} "
+                f"[ppo] iter {it:4d}/{cfg.max_iterations} | r={mean_step_rew:+.3f} "
+                f"env={iter_env_rew / T:+.3f} mim={iter_mimic_rew / T:+.3f} "
+                f"wlk={iter_walk_shape / T:+.3f} car={iter_carry_shape / T:+.3f} drp={iter_drop_shape / T:+.3f} "
+                f"suc={iter_success_rew / T:+.3f} | P={iter_pick_fires} C={iter_carry_fires} D={iter_drop_fires} "
+                f"done={iter_drops_done} falls={iter_falls} | kl={mean_kl:.4f} "
+                f"std={actor.log_std.exp().mean().item():.3f} lr={lr:.1e} "
                 f"| iter_s={iter_s:.1f} elapsed={_fmt_hms(elapsed_s)} eta={_fmt_hms(eta_s)}"
             )
 
