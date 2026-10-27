@@ -397,9 +397,14 @@ def build_dataset_wpcd(
     _disable_terminations(env_cfg)
     env_cfg.episode_length_s = float(max_steps) * env_cfg.sim.mujoco.timestep * env_cfg.decimation
     agent_cfg = load_rl_cfg(PICK_TASK_ID)
+    if verbose:
+        print(f"[wpcd] compiling mjlab env with num_envs={num_envs} (this is the slow part at high env counts)...", flush=True)
+    _t_setup = time.time()
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=None)
     env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
     device_t = base_env.scene["robot"].data.root_link_pos_w.device
+    if verbose:
+        print(f"[wpcd] env built in {time.time() - _t_setup:.1f}s; loading expert policies...", flush=True)
 
     pick_runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
     pick_runner.load(str(resolve_ckpt(BY_NAME["pick"])), load_cfg={"actor": True}, strict=True, map_location=device)
@@ -417,6 +422,8 @@ def build_dataset_wpcd(
         ckpt_path=resolve_ckpt(BY_NAME["place"]),
         obs_dim=DROP_OBS_DIM, action_dim=29, hidden=(512, 256, 128), device=device,
     )
+    if verbose:
+        print(f"[wpcd] expert policies loaded; initial teleport + CUDA graph capture...", flush=True)
 
     _ = env.get_observations()
     idx_cache = _resolve_pick_indices(base_env)
@@ -453,8 +460,11 @@ def build_dataset_wpcd(
     )
     spawn_z = torch.full((num_envs,), cfg.spawn_z, device=device_t)
     _teleport_robot_batch(base_env, spawn_xy, spawn_z, spawn_yaw)
+    _t_step = time.time()
     env.step(torch.zeros(num_envs, UNIFIED_ACT_DIM, device=device_t))
     _snap_pick_commands_batched(base_env)
+    if verbose:
+        print(f"[wpcd] first env.step done in {time.time() - _t_step:.1f}s; planning walk A* for {num_envs} envs...", flush=True)
 
     origins_np = base_env.scene.env_origins[:, :2].detach().cpu().numpy()
     box_rel_np = (box_world - torch.from_numpy(origins_np).to(device_t)).detach().cpu().numpy()
