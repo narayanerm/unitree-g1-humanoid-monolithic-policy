@@ -395,6 +395,11 @@ def build_dataset_wpcd(
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = num_envs
     env_cfg.scene.env_spacing = env_spacing
+    # Sparse Jacobian: with a 2nd table doubling bodies and nworld >= 1024, the
+    # dense efc.J ((nworld, njmax_pad, nv_pad)) was blowing past 380 MB and the
+    # mjwarp GPU allocator was failing. Sparse packs efc.J into (nworld, 1,
+    # njmax_nnz) which stays small enough for 8192 envs on 31 GB VRAM.
+    env_cfg.sim.mujoco.jacobian = "sparse"
     table2_rel_xy_np = _sample_table2_positions_np(num_envs, table2_r_min, table2_r_max, seed)
     env_cfg.scene.spec_fn = _make_two_tables_spec_fn(num_envs, env_spacing, table2_rel_xy_np)
     _disable_terminations(env_cfg)

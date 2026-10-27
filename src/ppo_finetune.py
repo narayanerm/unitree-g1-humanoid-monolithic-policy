@@ -536,6 +536,9 @@ def ppo_finetune(
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = cfg.num_envs
     env_cfg.scene.env_spacing = cfg.env_spacing
+    # Sparse Jacobian keeps efc.J small enough on GPU at high env counts; the
+    # dense form at nworld=1024 already overflowed VRAM on a 31 GB RTX 5090.
+    env_cfg.sim.mujoco.jacobian = "sparse"
     table2_rel_xy_np = _sample_table2_positions_np(cfg.num_envs, cfg.table2_r_min, cfg.table2_r_max, cfg.seed)
     env_cfg.scene.spec_fn = _make_two_tables_spec_fn(cfg.num_envs, cfg.env_spacing, table2_rel_xy_np)
     _disable_terminations(env_cfg)
