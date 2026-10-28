@@ -119,6 +119,7 @@ def _astar(occ: np.ndarray, s: tuple[int, int], t: tuple[int, int]) -> Optional[
     n0, n1 = occ.shape
 
     def h(c):
+        """Octile distance from ``c`` to ``t``, admissible for 8-connected unit-cost moves."""
         dx = abs(c[0] - t[0])
         dy = abs(c[1] - t[1])
         return (dx + dy) + (1.4142 - 2.0) * min(dx, dy)

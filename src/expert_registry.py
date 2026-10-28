@@ -1,3 +1,8 @@
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
 """Registry of the four expert policies driven by the FSM controller."""
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ TERMINAL_BUFFER_DIR = ROOT / "outputs"
 
 @dataclass(frozen=True)
 class ExpertPhase:
-    """One atomic segment of the chain (walk / pick / carry / place)."""
+    """One atomic segment of the chain (walk, pick, carry, place)."""
     phase_id: int
     name: str
     policy_module: str
@@ -45,7 +50,7 @@ def resolve_ckpt(phase: ExpertPhase) -> Path:
 
 
 def resolve_terminal_buffer(phase: ExpertPhase) -> Optional[Path]:
-    """Locate the .npz this phase writes to warm-start the successor.
+    """Locate the .npz this phase writes to warm-start its successor.
     Args: phase: the PHASES entry.
     Returns: Path or None if the phase does not seed a successor.
     """

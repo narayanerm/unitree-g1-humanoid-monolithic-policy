@@ -60,11 +60,11 @@ class RunningMeanStd(nn.Module):
         self.count.copy_(tot_count)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalise x with the running stats.
+        """Normalise x with the running stats, clamped to prevent explosions from near-zero-variance dims.
         Args: x: (n, dim) tensor.
-        Returns: (n, dim) tensor.
+        Returns: (n, dim) tensor clamped to [-5, 5].
         """
-        return (x - self.mean) / (self.var.sqrt() + self.eps)
+        return ((x - self.mean) / (self.var.sqrt() + self.eps)).clamp(-5.0, 5.0)
 
 
 class MonolithicPolicyStudent(nn.Module):

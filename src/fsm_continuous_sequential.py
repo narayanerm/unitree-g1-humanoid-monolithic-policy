@@ -1,9 +1,13 @@
-"""Sequential wrapper around ``fsm_continuous_batch.build_dataset``: runs K independent episodes with num_envs=1 each (one Python subprocess per episode to keep mjlab/warp context memory from accumulating across runs), then concatenates the per-episode .npz into one unified dataset. Optionally saves an mp4 per episode.
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
+"""Legacy sequential driver that runs K single-env walk-to-pick episodes via subprocesses, then concatenates them into one dataset.
 
-Purpose: works around a batch (num_envs>=2) failure of the walk-to-pick handover we could not isolate (mjlab/mjwarp physics diverges subtly between batch=1 and batch>=2). Sequential N=1 keeps success rate around 78 to 100% per episode. Subprocess isolation avoids the ~150 MB/episode leak that OOMs a monolithic loop around episode 60.
-
+Subprocess isolation sidesteps a mjlab/mjwarp context leak (~150 MB per episode) and a batch (num_envs>=2) divergence of the handover that we could not isolate; sequential num_envs=1 keeps per-episode success at 78 to 100%.
 Input:  staged experts at ``experts/{walk,pick}.pt``.
-Output: ``outputs/walk_pick_sequential.npz`` (unified schema) plus optional ``outputs/media/seq_ep_<ii>_seed<S>.mp4`` per episode. Per-episode intermediate .npz files are kept under ``outputs/fsm_seq_cache/`` until the final concatenation succeeds, so a crash mid-run can be recovered.
+Output: ``outputs/walk_pick_sequential.npz`` plus optional ``outputs/media/seq_ep_<ii>_seed<S>.mp4``; per-episode .npz cached under ``outputs/fsm_seq_cache/`` for crash recovery.
 """
 
 from __future__ import annotations
@@ -28,9 +32,9 @@ def _run_episode_subprocess(
     device: str, max_steps: int, spawn_r_min: float, spawn_r_max: float,
     use_astar: bool, fsm_root: Path,
 ) -> tuple[int, int, int]:
-    """Launch a single ``fsm_continuous_batch`` subprocess (num_envs=1) and wait for it.
-    Args: i: episode index (for log tagging); seed_i: per-episode seed; tmp_npz: output .npz path (skipped if already exists for crash-recovery); video_path: optional mp4 output; device: torch device string; max_steps: per-episode step cap; spawn_r_min/spawn_r_max: annulus radii (m); use_astar: forward the --astar flag; fsm_root: repo root for the subprocess cwd.
-    Returns: (i, seed_i, returncode); returncode<0 means the npz was reused without re-running.
+    """Spawn one ``fsm_continuous_batch`` subprocess at num_envs=1 and wait for its npz.
+    Args: i: episode index; seed_i: episode seed; tmp_npz: output .npz (skipped if present for resume); video_path: optional mp4; device: torch device; max_steps: step cap; spawn_r_min, spawn_r_max: annulus radii (m); use_astar: forward ``--astar``; fsm_root: subprocess cwd.
+    Returns: tuple (i, seed_i, returncode); returncode<0 means tmp_npz was reused.
     """
     if tmp_npz.exists():
         return i, seed_i, -1
@@ -69,8 +73,8 @@ def build_sequential_dataset(
     failed_dir: Optional[Path | str] = None,
     workers: int = 1,
 ) -> dict:
-    """Run K single-env episodes and concatenate into one .npz, optionally saving mp4 per episode.
-    Args: K: episode count; base_seed: first episode's seed; out_path: final concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min: inner annulus radius; spawn_r_max: outer annulus radius; videos_dir: if set, writes one mp4 per episode there; use_astar: forward --astar to each subprocess so the walk phase follows an A* path around the pick table; failed_dir: if set, per-episode .npz of fallen episodes is copied here (plus a metadata.json summarizing all episodes) so the caller can diagnose why the FSM chain fails; workers: parallel subprocess pool size (default 1 = original serial behavior; each subprocess still uses num_envs=1, so the mjwarp batch divergence that destabilised the walk-to-pick handover at num_envs>=2 is sidestepped by process isolation).
+    """Run K single-env episodes in subprocess isolation and concatenate the surviving ones into one .npz.
+    Args: K: episode count; base_seed: first seed; out_path: concatenated .npz; device: torch device; max_steps: per-episode cap; spawn_r_min, spawn_r_max: annulus radii (m); videos_dir: optional per-episode mp4 dir; use_astar: forward ``--astar`` so walk follows an A* path around the table; failed_dir: optional archive of fallen-episode .npz plus a metadata.json for offline diagnosis; workers: parallel pool size (default 1 keeps the serial path; each worker still runs num_envs=1 so the mjwarp batch divergence stays isolated).
     Returns: dict with total_transitions, pick_successes, walk_kept, pick_kept, per_episode list.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -83,12 +87,12 @@ def build_sequential_dataset(
         failed_dir.mkdir(parents=True, exist_ok=True)
 
     fsm_root = Path(__file__).resolve().parent.parent
-    # Per-episode .npz cache under outputs/ (not /tmp) so partial progress survives reboots and tmpfs clears; wiped on successful concat, left behind on crash so a re-run resumes.
+    # Per-episode cache lives under outputs/ (not /tmp) so partial progress survives reboots and tmpfs clears; a re-run resumes from whatever is left after a crash.
     tmp_dir = fsm_root / "outputs" / "fsm_seq_cache"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     def paths_for(i: int) -> tuple[int, Path, Optional[Path]]:
-        """Resolve per-episode seed, cache path, and optional video path for episode index i.
+        """Resolve the seed, cache .npz path, and optional video path for episode i.
         Args: i: episode index.
         Returns: tuple (seed, tmp_npz, video_path); video_path is None when videos_dir is unset.
         """
@@ -97,12 +101,12 @@ def build_sequential_dataset(
         video_path = videos_dir / f"seq_ep_{i:03d}_seed{seed_i}.mp4" if videos_dir is not None else None
         return seed_i, tmp_npz, video_path
 
-    # Phase 1: launch subprocesses (serial if workers=1, parallel otherwise), one progress line per completed subprocess so a long run (K=2000) is not silent.
+    # Phase 1: launch subprocesses (serial for workers=1, parallel otherwise); one progress line per completion keeps long K from going silent.
     workers = max(1, int(workers))
 
     def print_progress(k_done: int, i: int, seed_i: int, rc: int) -> None:
-        """Emit a live progress line for the episode that just finished.
-        Args: k_done: how many episodes have completed so far (1-indexed); i: episode index; seed_i: episode seed; rc: subprocess returncode (negative means reused existing tmp_npz).
+        """Print one progress line for the episode that just finished.
+        Args: k_done: 1-indexed completion count; i: episode index; seed_i: episode seed; rc: subprocess returncode (negative means tmp_npz was reused).
         Returns: none.
         """
         status = "reused" if rc < 0 else ("done" if rc == 0 else f"FAILED rc={rc}")
@@ -129,22 +133,24 @@ def build_sequential_dataset(
                 ))
             k_done = 0
             for fut in as_completed(futs):
-                i_done, seed_done, rc = fut.result()  # surfaces any exception too
+                i_done, seed_done, rc = fut.result()
                 k_done += 1
                 print_progress(k_done, i_done, seed_done, rc)
 
-    # Phase 2: load each per-ep npz in index order to keep output deterministic and npz reads cheap, even when workers>1.
+    # Phase 2: load every per-episode npz in index order so the concatenated output stays deterministic regardless of worker count.
     all_obs: list[np.ndarray] = []
     all_act: list[np.ndarray] = []
     all_phase: list[np.ndarray] = []
     per_episode: list[dict] = []
     total_pick = 0
     dropped_fell = 0
-    dropped_stuck = 0  # upright but never closed pick before max_steps; filtering these out stops the student from being trained on failed box approaches.
+    # Stuck episodes stay upright but never close the pick before max_steps; filtering them keeps the student off failed box approaches.
+    dropped_stuck = 0
     for i in range(K):
         seed_i, tmp_npz, video_path = paths_for(i)
         if not tmp_npz.exists():
-            continue  # subprocess failed; already logged
+            # Subprocess already logged its failure in Phase 1.
+            continue
         blob = np.load(str(tmp_npz))
         obs_i = blob["unified_obs"]
         act_i = blob["action"]
@@ -152,7 +158,7 @@ def build_sequential_dataset(
         fell_i = int(blob["fell"]) if "fell" in blob.files else 0
         walk_i = int((phase_i == 0).sum())
         pick_i = int((phase_i == 1).sum())
-        # Success proxy: has pick transitions AND ended before max_steps (i.e., FSM closed voluntarily).
+        # Success proxy: at least one pick transition and the FSM closed voluntarily (ended before max_steps).
         ep_success = 1 if (pick_i > 0 and obs_i.shape[0] < max_steps) else 0
         total_pick += ep_success
 
@@ -251,7 +257,7 @@ def build_sequential_dataset(
             }, f, indent=2)
         print(f"[seq] wrote {metadata_path} ({dropped_fell} failed episodes archived)")
 
-    # Concat succeeded, so per-episode intermediates are no longer needed for recovery.
+    # Concat succeeded; per-episode intermediates are no longer needed for crash recovery.
     for i in range(K):
         seed_i = base_seed + i
         (tmp_dir / f"ep_{i:03d}_seed{seed_i}.npz").unlink(missing_ok=True)
@@ -268,8 +274,8 @@ def build_sequential_dataset(
 
 
 def _main() -> None:
-    """Parse CLI flags and dispatch to build_sequential_dataset.
-    Args: none, reads --episodes, --base-seed, --out, --videos-dir, --max-steps, --r-min, --r-max, --device, --astar from sys.argv.
+    """Parse CLI flags and dispatch to ``build_sequential_dataset``.
+    Args: none; reads episode count, seeding, output paths, step cap, annulus radii, device, and A* toggle from sys.argv.
     Returns: none.
     """
     import argparse

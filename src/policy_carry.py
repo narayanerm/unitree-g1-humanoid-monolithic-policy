@@ -304,11 +304,11 @@ TASK_ID = "Mjlab-G1-Carry"
 SNAPSHOT_ENTITIES = ["robot", "box"]
 SNAPSHOT_YAW_ALIGN = True
 
-_spec_model = get_spec().compile()
+spec_model = get_spec().compile()
 G1_JOINTS = tuple(
-    mujoco.mj_id2name(_spec_model, mujoco.mjtObj.mjOBJ_JOINT, i)
-    for i in range(_spec_model.njnt)
-    if _spec_model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE
+    mujoco.mj_id2name(spec_model, mujoco.mjtObj.mjOBJ_JOINT, i)
+    for i in range(spec_model.njnt)
+    if spec_model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE
 )
 G1_HOME_ROOT_POS = KNEES_BENT_KEYFRAME.pos
 G1_HOME_ROOT_ROT = KNEES_BENT_KEYFRAME.rot

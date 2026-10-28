@@ -1,14 +1,12 @@
 ##########################################################################################
 # Project    : unitree-g1-humanoid-monolithic-policy                                     #
 # Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/itandroids/itandroids-academic              #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
-"""Batched walk-to-pick FSM dataset builder that scales to 2k+ envs on a single GPU.
-Lifts the num_envs==1 restriction from src.fsm_continuous_batch.build_dataset by
-plumbing per-env A* paths, replica static tables via SceneCfg.spec_fn, env_spacing
-of 20 m, and a longer max_steps default. Measured on a GTX 1650 (4 GB) with
-spawn_r=[0.2, 5.0] and max_steps=1200: 100% pick success at num_envs=16, 89% at
-num_envs=64, 89% at num_envs=256.
+"""Batched walk-to-pick FSM dataset builder that scales to 2k+ envs on one GPU.
+
+Input:  pick/walk checkpoints under ``outputs/logs/`` and SceneCfg hooks for replica tables.
+Output: .npz with unified_obs, action, phase arrays plus a stats dict for the caller.
 """
 
 from __future__ import annotations
@@ -48,9 +46,8 @@ def _env_origin_offsets(num_envs: int, env_spacing: float) -> list[tuple[float, 
     Args: num_envs: parallel env count; env_spacing: metres between adjacent env origins.
     Returns: list of (x, y) offsets per env matching ``scene.env_origins`` placement.
     """
-    import numpy as _np
-    num_rows = int(_np.ceil(num_envs / int(_np.sqrt(num_envs))))
-    num_cols = int(_np.ceil(num_envs / num_rows))
+    num_rows = int(np.ceil(num_envs / int(np.sqrt(num_envs))))
+    num_cols = int(np.ceil(num_envs / num_rows))
     offsets = []
     for idx in range(num_envs):
         row = idx // num_cols
@@ -180,7 +177,6 @@ def build_dataset_batched_fixed(
 
     from src.policy_pick import TASK_ID as PICK_TASK_ID
     from src.policy_pick import register as register_pick
-    
 
     cfg = RolloutConfig(seed=seed, max_steps=max_steps)
     cfg.walk_to_pick_dist = 0.55

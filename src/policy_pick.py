@@ -1,8 +1,12 @@
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
 """G1 pick task definition shared by training and analysis notebooks.
 
-The G1 humanoid stands in front of a table, reaches for a box with both hands,
-grasps it, and lifts it to a target height. Exposes TASK_ID plus the mjlab env
-and PPO runner factories consumed by the training entrypoint.
+Input:  play flag (bool) for g1_pick_env_cfg; no external args elsewhere.
+Output: TASK_ID plus mjlab env and PPO runner factories consumed by the training entrypoint.
 """
 
 from __future__ import annotations
@@ -611,7 +615,7 @@ def stay_still_penalty(
     root_vel = env.scene["robot"].data.root_link_lin_vel_w
     v_sq = torch.sum(root_vel * root_vel, dim=-1)
     if left_hand_cfg is None or right_hand_cfg is None or box_cfg is None:
-        return v_sq  # ungated fallback for backward compatibility
+        return v_sq  # ungated fallback when caller omits the hand/box gate
 
     dl = torch.linalg.norm(_entity_pos(env, left_hand_cfg)  - _desired_grasp_pos_w(env, box_cfg, "left"),  dim=-1)
     dr = torch.linalg.norm(_entity_pos(env, right_hand_cfg) - _desired_grasp_pos_w(env, box_cfg, "right"), dim=-1)
@@ -1815,7 +1819,7 @@ def build_g1_pick_mdp():
         ),
     }
 
-    # Curriculum widens base-reset and command ranges together.
+    # Single-axis curriculum ramps body_bias from SQUAT_GRIP (1.0) to walk-terminal (0.0).
     curriculum = {
         "reset_stages": CurriculumTermCfg(func=pick_curriculum, params={}),
     }

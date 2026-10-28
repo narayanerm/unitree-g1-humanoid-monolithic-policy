@@ -88,24 +88,27 @@ def _load_actor_from_state_dict(
     from rsl_rl.models.mlp_model import MLPModel
 
     class _WalkNormaliserActor(nn.Module):
-        """Wrapper mirroring MjlabOnPolicyRunner's deterministic inference path."""
-        def __init__(self, mlp: nn.Sequential, normalizer_mean: torch.Tensor, normalizer_var: torch.Tensor, eps: float = 1e-8):
-            """Store the trained MLP and obs normaliser stats.
-            Args: mlp: trained mlp; normalizer_mean: running mean; normalizer_var: running variance; eps: variance floor.
+        """Wrapper mirroring MjlabOnPolicyRunner's deterministic inference path.
+        Matches rsl_rl.modules.normalization.EmpiricalNormalization.forward:
+          (x - _mean) / (_std + eps),  eps = 1e-2 (default).
+        """
+        def __init__(self, mlp: nn.Sequential, normalizer_mean: torch.Tensor, normalizer_std: torch.Tensor, eps: float = 1e-2):
+            """Store the MLP trunk and register normaliser statistics as buffers.
+            Args: mlp: ELU trunk; normalizer_mean: obs mean; normalizer_std: obs std; eps: denominator stabiliser matching rsl-rl default.
             Returns: none.
             """
             super().__init__()
             self.mlp = mlp
             self.register_buffer("mean", normalizer_mean)
-            self.register_buffer("var", normalizer_var)
+            self.register_buffer("std", normalizer_std)
             self.eps = eps
 
         def forward(self, obs_dict: dict) -> torch.Tensor:
-            """Normalise the actor obs and run the MLP.
-            Args: obs_dict: dict with key "actor" holding (n, obs_dim) tensor.
-            Returns: (n, action_dim) action tensor.
+            """Normalise the actor obs and run the deterministic MLP forward pass.
+            Args: obs_dict: dict with key "actor" holding the (n, obs_dim) tensor.
+            Returns: (n, action_dim) tensor of mean actions.
             """
-            x = (obs_dict["actor"] - self.mean) / (self.var.sqrt() + self.eps)
+            x = (obs_dict["actor"] - self.mean) / (self.std + self.eps)
             return self.mlp(x)
 
     blob = torch.load(str(ckpt_path), map_location=device, weights_only=False)
@@ -124,13 +127,17 @@ def _load_actor_from_state_dict(
     mlp.load_state_dict(mlp_state)
 
     mean = actor_sd.get("obs_normalizer._mean", None)
-    var = actor_sd.get("obs_normalizer._var", None)
-    if mean is None or var is None:
+    std = actor_sd.get("obs_normalizer._std", None)
+    if std is None:
+        var = actor_sd.get("obs_normalizer._var", None)
+        if var is not None:
+            std = var.sqrt()
+    if mean is None or std is None:
         # Fallback for older rsl-rl builds that used flat keys.
         mean = actor_sd.get("obs_normalizer.mean", torch.zeros(obs_dim, device=device))
-        var = actor_sd.get("obs_normalizer.var", torch.ones(obs_dim, device=device))
+        std = actor_sd.get("obs_normalizer.std", torch.ones(obs_dim, device=device))
 
-    actor = _WalkNormaliserActor(mlp, mean.to(device), var.to(device)).to(device).eval()
+    actor = _WalkNormaliserActor(mlp, mean.to(device), std.to(device)).to(device).eval()
     return actor
 
 

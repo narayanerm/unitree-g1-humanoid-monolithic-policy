@@ -1,13 +1,16 @@
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
 """Closed-loop rollout of the monolithic student in the pick scene.
 
-Loads a ``MonolithicPolicyStudent`` checkpoint, rolls it out for N episodes with
-different spawns and goals, prints a pass/fail table, and writes an mp4 of the
-first episode with a tracking camera on the robot.
+Input:  ``model_best.pt`` under ``outputs/logs/g1_monolithic/`` plus the registered pick env.
+Output: pass/fail table on stdout and an mp4 of the first few episodes under ``outputs/media/``.
 
-The FSM phase fed to the student mirrors ``fsm_continuous_batch``: ``phase=walk``
-while far from the box, flips to ``phase=pick`` once the walk brake predicate
-fires (close, slow, upright). No expert weights are used; the student's own
-action closes the loop.
+The FSM phase fed to the student mirrors ``fsm_continuous_batch``: ``phase=walk`` while far from
+the box, flips to ``phase=pick`` once the walk brake predicate fires (close, slow, upright). No
+expert weights are used; the student's own action closes the loop.
 """
 
 from __future__ import annotations
@@ -39,7 +42,10 @@ DEFAULT_VIDEO = ROOT / "outputs" / "media" / "student_rollout.mp4"
 
 @dataclass
 class EpisodeResult:
-    """Outcome of one rollout."""
+    """Per-episode outcome: seed, step count, phase/lift/fall flags, and closest approach to the box.
+    Args: seed: RNG seed; steps: steps executed; reached_pick: walk-to-pick fired; lifted: box crossed lift threshold; fell: robot tipped over; min_dist: closest planar distance to the box.
+    Returns: dataclass instance; no methods.
+    """
     seed: int
     steps: int
     reached_pick: bool
@@ -82,7 +88,7 @@ def _rollout_episode(
     torch.cuda.manual_seed_all(int(seed))
     np.random.seed(int(seed))
 
-    base_env.reset()  # restore default joints and rerandomise box so the previous episode's fallen pose does not leak into the next spawn
+    base_env.reset()  # rerandomise box and restore default joints so a fallen pose from the previous episode cannot leak in
 
     goal = sample_goal(1, device=device, seed=seed)
 

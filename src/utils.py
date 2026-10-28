@@ -149,7 +149,7 @@ def export_policy_to_onnx(
     obs_dim = int(env.get_observations()[0][obs_group].shape[-1])
     action_dim = int(env.num_actions)
 
-    # Wraps raw obs -> normalize -> MLP -> deterministic action.
+    # Wraps raw obs, normalize, MLP, deterministic action.
     class Deployable(nn.Module):
         """Fuse observation normaliser and actor MLP into a single deployable module."""
 

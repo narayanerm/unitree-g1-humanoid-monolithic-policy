@@ -1,3 +1,8 @@
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
 """Unified student observation used across every FSM phase.
 
 Input:  a mjlab ManagerBasedRlEnv (any of the four phase envs); the current phase id; a GoalSample.
@@ -28,12 +33,13 @@ UNIFIED_ACT_DIM = NUM_JOINTS
 @dataclass
 class GoalSample:
     """One goal draw for the whole chain, held constant while the FSM rolls out.
-    Fields are world-frame tensors sized (num_envs, ...).
+    Fields: object_init_pos_w (n, 3); object_init_quat_w (n, 4); place_target_pos_w (n, 3); place_target_quat_w (n, 4).
+    Frame: all tensors are world-frame.
     """
-    object_init_pos_w: torch.Tensor       # (n, 3)
-    object_init_quat_w: torch.Tensor      # (n, 4)
-    place_target_pos_w: torch.Tensor      # (n, 3)
-    place_target_quat_w: torch.Tensor     # (n, 4)
+    object_init_pos_w: torch.Tensor
+    object_init_quat_w: torch.Tensor
+    place_target_pos_w: torch.Tensor
+    place_target_quat_w: torch.Tensor
 
 
 def _quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

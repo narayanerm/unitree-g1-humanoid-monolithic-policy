@@ -1,15 +1,12 @@
 ##########################################################################################
 # Project    : unitree-g1-humanoid-monolithic-policy                                     #
 # Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/itandroids/itandroids-academic              #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
 """Batched walk-pick-carry-drop FSM dataset builder scaling to 1k+ envs on one GPU.
 
-Four phases rolled under the pick env infrastructure (shared robot + box state).
-Carry (124-dim) and drop (147-dim) observations are constructed manually from
-the shared state, avoiding instantiation of separate carry/drop worlds and the
-teleport that would entail. Walk-pick fixes carried over: per-env A*, env_spacing,
-per-env replica tables via spec_fn, _snap_pick_commands_batched at fire.
+Input:  pick env + the four expert checkpoints (walk, pick, carry, place).
+Output: .npz with unified_obs, action, phase arrays for monolithic BC training.
 """
 
 from __future__ import annotations
@@ -127,13 +124,9 @@ def _make_two_tables_spec_fn(num_envs: int, env_spacing: float, table2_rel_xy: n
     from src.policy_pick import TABLE_X, TABLE_HEIGHT, TABLE_TOP_HALF
     offsets = _env_origin_offsets(num_envs, env_spacing)
 
-    def _spec_fn(spec: mujoco.MjSpec) -> None:
-        # Scale the MuJoCo stack arena with num_envs: mj_forward's broad-phase
-        # contact pass needed ~66 KB/env in practice (8192 envs -> 540 MB).
-        # Floor at the auto default (~32 MB) for small runs, cap at 1 GB so
-        # the mjwarp GPU arrays downstream don't inflate past VRAM: setting a
-        # flat 2 GB blew up a single 380 MB allocation on the GPU side.
-        per_env_bytes = 128 * 1024  # 2x the empirical worst-case per env
+    def spec_fn(spec: mujoco.MjSpec) -> None:
+        # Scale MuJoCo stack arena with num_envs (~66 KB/env measured, floor 32 MB, cap 1 GB): a flat 2 GB blew up a single 380 MB mjwarp allocation on the GPU side.
+        per_env_bytes = 128 * 1024
         arena = max(32 * (1 << 20), per_env_bytes * num_envs)
         spec.memory = min(arena, 1 * (1 << 30))
         leg_len_z = TABLE_HEIGHT - TABLE_TOP_HALF
@@ -170,7 +163,7 @@ def _make_two_tables_spec_fn(num_envs: int, env_spacing: float, table2_rel_xy: n
                     size=(0.025, 0.025, leg_half_z), pos=(lx, ly, leg_center_z),
                     rgba=(0.22, 0.55, 0.35, 1.0),
                 )
-    return _spec_fn
+    return spec_fn
 
 
 def _plan_carry_per_env(
@@ -311,9 +304,7 @@ def _compute_drop_obs(
     from src.policy_carry import BOX_HALF
     box_size = torch.full_like(box_rel, 2.0 * BOX_HALF)
 
-    # cmd_object_target_pos: snapshot of the box world pose at drop_fire (training
-    # stashes this once at reset; must stay frozen through the drop phase).
-    # Fall back to current box pose if snapshot not supplied.
+    # cmd_object_target_pos is a box-pose snapshot taken at drop_fire and frozen through the drop phase (training stashes it at reset); fall back to current pose if the caller did not supply one.
     if object_target_pos_w is None:
         object_target_pos_w = box_pos_w
         object_target_quat_w = box_quat
@@ -395,12 +386,7 @@ def build_dataset_wpcd(
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = num_envs
     env_cfg.scene.env_spacing = env_spacing
-    # Pick env defaults (nconmax=200 njmax=800 jacobian=auto) are kept.
-    # Earlier runs forced sparse + half caps to fit 1024+ envs in 31 GB VRAM,
-    # but the drop expert produced |action|~1e6 outputs in those runs (likely
-    # NaN propagation under over-constrained solver), destroying the BC dataset
-    # for the drop phase. If you hit mjwarp OOM at high num_envs, lower
-    # num_envs instead; do not re-add the sparse/tight-cap workaround.
+    # Keep pick env defaults (nconmax=200 njmax=800 jacobian=auto): earlier runs with sparse + half caps fit 1024+ envs in 31 GB VRAM but the drop expert emitted |action|~1e6 outputs (likely NaN propagation under over-constrained solver) and destroyed the drop-phase BC dataset. On mjwarp OOM at high num_envs, lower num_envs; do not re-add the sparse/tight-cap workaround.
     table2_rel_xy_np = _sample_table2_positions_np(num_envs, table2_r_min, table2_r_max, seed)
     env_cfg.scene.spec_fn = _make_two_tables_spec_fn(num_envs, env_spacing, table2_rel_xy_np)
     _disable_terminations(env_cfg)
@@ -408,12 +394,12 @@ def build_dataset_wpcd(
     agent_cfg = load_rl_cfg(PICK_TASK_ID)
     if verbose:
         print(f"[wpcd] compiling mjlab env with num_envs={num_envs} (this is the slow part at high env counts)...", flush=True)
-    _t_setup = time.time()
+    t_setup = time.time()
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=None)
     env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
     device_t = base_env.scene["robot"].data.root_link_pos_w.device
     if verbose:
-        print(f"[wpcd] env built in {time.time() - _t_setup:.1f}s; loading expert policies...", flush=True)
+        print(f"[wpcd] env built in {time.time() - t_setup:.1f}s; loading expert policies...", flush=True)
 
     pick_runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
     pick_runner.load(str(resolve_ckpt(BY_NAME["pick"])), load_cfg={"actor": True}, strict=True, map_location=device)
@@ -442,11 +428,11 @@ def build_dataset_wpcd(
     trunk_id = idx_cache["trunk"]
 
     # Preload carry terminal buffer so drop handoff can sample a canonical pose.
-    _carry_buf_path = ROOT / "outputs" / "carry_terminal_states.npz"
-    _carry_buf = None
-    if _carry_buf_path.exists():
-        buf_np = np.load(str(_carry_buf_path))
-        _carry_buf = {
+    carry_buf_path = ROOT / "outputs" / "carry_terminal_states.npz"
+    carry_buf = None
+    if carry_buf_path.exists():
+        buf_np = np.load(str(carry_buf_path))
+        carry_buf = {
             "joint_pos": torch.from_numpy(buf_np["joint_pos"]).to(device_t),
             "root_z": torch.from_numpy(buf_np["root_z"]).to(device_t),
             "quat_zy": torch.from_numpy(buf_np["quat_zy"]).to(device_t),
@@ -454,32 +440,29 @@ def build_dataset_wpcd(
             "box_quat_by": torch.from_numpy(buf_np["box_quat_by"]).to(device_t),
         }
         if verbose:
-            print(f"[wpcd] loaded carry terminal buffer ({_carry_buf['joint_pos'].shape[0]} samples)")
+            print(f"[wpcd] loaded carry terminal buffer ({carry_buf['joint_pos'].shape[0]} samples)")
     _override_box_spawn_fsm(base_env, box_x=0.45, jitter_x=0.02, jitter_y=0.05, seed=cfg.seed)
     box_world = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
-    # Reject spawns too close to table 2 (robot clearance ~0.3 m + table 2
-    # half-extent ~0.42 m + margin): otherwise the robot can spawn with a leg
-    # intersecting the second table and never move.
-    _origins_pre = base_env.scene.env_origins[:, :2]
-    _table2_world_pre = _origins_pre + torch.from_numpy(table2_rel_xy_np).to(device_t)
+    # Reject spawns too close to table 2 (robot ~0.3 m + table half-extent ~0.42 m + margin): otherwise the robot can spawn with a leg clipped into the second table and never move.
+    origins_pre = base_env.scene.env_origins[:, :2]
+    table2_world_pre = origins_pre + torch.from_numpy(table2_rel_xy_np).to(device_t)
     spawn_xy, spawn_yaw = _random_spawn_annulus(box_world, spawn_r_min, spawn_r_max, cfg.seed, device)
     spawn_xy = _resample_spawn_outside_t2(
-        spawn_xy, box_world, _table2_world_pre,
+        spawn_xy, box_world, table2_world_pre,
         r_min=spawn_r_min, r_max=spawn_r_max, safety=1.0, seed=cfg.seed, device=device,
     )
     spawn_z = torch.full((num_envs,), cfg.spawn_z, device=device_t)
     _teleport_robot_batch(base_env, spawn_xy, spawn_z, spawn_yaw)
-    _t_step = time.time()
+    t_step = time.time()
     env.step(torch.zeros(num_envs, UNIFIED_ACT_DIM, device=device_t))
     _snap_pick_commands_batched(base_env)
     if verbose:
-        print(f"[wpcd] first env.step done in {time.time() - _t_step:.1f}s; planning walk A* for {num_envs} envs...", flush=True)
+        print(f"[wpcd] first env.step done in {time.time() - t_step:.1f}s; planning walk A* for {num_envs} envs...", flush=True)
 
     origins_np = base_env.scene.env_origins[:, :2].detach().cpu().numpy()
     box_rel_np = (box_world - torch.from_numpy(origins_np).to(device_t)).detach().cpu().numpy()
     spawn_rel_np = (spawn_xy - torch.from_numpy(origins_np).to(device_t)).detach().cpu().numpy()
-    # Add table 2 (origin-relative) as a per-env obstacle so walk's A* routes around
-    # it instead of straight through — otherwise the robot clips table 2 on approach.
+    # Table 2 (origin-relative) is a per-env obstacle so walk's A* routes around it: otherwise the robot clips table 2 on approach.
     t2_obstacles_per_env = [
         [(float(table2_rel_xy_np[i, 0]), float(table2_rel_xy_np[i, 1]), TABLE2_HALF_X, TABLE2_HALF_Y)]
         for i in range(num_envs)
@@ -514,10 +497,7 @@ def build_dataset_wpcd(
     origins_t = torch.from_numpy(origins_np).to(device_t)
     table2_world_xy = origins_t + table2_rel_torch
     table1_rel_np = (box_world - origins_t).detach().cpu().numpy()
-    # Per-env carry destination: locked at carry_fire to the exact spot 0.61 m
-    # before the table 2 center along the straight-line approach direction.
-    # Matches drop training's pelvis-to-place-target distance (ROBOT_SPAWN_X_OFFSET=-0.05,
-    # PLACE_TARGET_X_CENTER=0.51 ⇒ 0.56 m + ~5 cm box-forward slack).
+    # Per-env carry destination: locked at carry_fire to 0.61 m before table 2 center along the straight-line approach, matching drop training's pelvis-to-place-target distance (ROBOT_SPAWN_X_OFFSET=-0.05, PLACE_TARGET_X_CENTER=0.51, so 0.56 m + ~5 cm box-forward slack).
     PELVIS_TO_T2_TRAINING = 0.61
     carry_approach_target_xy = table2_world_xy.clone()
 
@@ -530,9 +510,7 @@ def build_dataset_wpcd(
     place_target_pos_w[:, 2] = box_rest_z + base_env.scene.env_origins[:, 2]
     place_target_quat_w = torch.zeros(num_envs, 4, device=device_t)
     place_target_quat_w[:, 0] = 1.0
-    # Snapshot of the box world pose at drop_fire (frozen for the whole drop phase).
-    # cmd_object_target_pos / _quat obs read from this buffer, matching training's
-    # reset-time stashing in env.extras[_CMD_KEY + "object_target_*"].
+    # Box-pose snapshot taken at drop_fire and frozen through the drop phase; cmd_object_target_pos/_quat obs read from this buffer, matching training's reset-time stashing in env.extras[_CMD_KEY + "object_target_*"].
     object_target_pos_w = torch.zeros(num_envs, 3, device=device_t)
     object_target_quat_w = torch.zeros(num_envs, 4, device=device_t)
     object_target_quat_w[:, 0] = 1.0
@@ -656,9 +634,7 @@ def build_dataset_wpcd(
                 pick_action = pick_policy(pick_obs)
                 action = torch.where(in_pick.unsqueeze(-1), pick_action, action)
             if in_carry.any():
-                # A* pursuit toward the approach target (0.61 m before table 2
-                # along the locked carry-fire direction), routing around both
-                # tables. Falls back to direct pursuit once the tracker is spent.
+                # A* pursuit to the approach target (0.61 m before table 2 along the locked carry-fire direction), routing around both tables; falls back to direct pursuit once the tracker is spent.
                 robot_xy_w = robot.data.root_link_pos_w[:, :2]
                 robot_rel_c_np = (robot_xy_w - origins_t).detach().cpu().numpy()
                 approach_world_np = carry_approach_target_xy.detach().cpu().numpy()
@@ -669,11 +645,7 @@ def build_dataset_wpcd(
                 dist_tgt_now = torch.linalg.norm(
                     carry_approach_target_xy - robot.data.root_link_pos_w[:, :2], dim=-1,
                 )
-                # Pre-align stage (0.6 m > dist > 0.15 m from approach): if the
-                # robot's yaw is off, stop and rotate here — far enough from
-                # table 2 that swinging legs don't clip the table top during
-                # correction. Latched so the robot doesn't oscillate between
-                # rotate and pursuit once it has aligned the first time.
+                # Pre-align stage (0.6 m > dist > 0.15 m from approach): if yaw is off, stop and rotate here, far enough from table 2 that swinging legs don't clip the top during correction; latched to prevent oscillation between rotate and pursuit once aligned.
                 t2_dir_all_c = table2_world_xy - robot.data.root_link_pos_w[:, :2]
                 t2_dir_ang_c = torch.atan2(t2_dir_all_c[:, 1], t2_dir_all_c[:, 0])
                 heading_err_t2_c = torch.atan2(
@@ -720,16 +692,13 @@ def build_dataset_wpcd(
                 drop_action = drop_policy({"actor": drop_obs})
                 action = torch.where(in_drop.unsqueeze(-1), drop_action, action)
             if in_post_drop.any():
-                # Hold station after a successful drop: walk policy with zero twist
-                # keeps the robot standing (action=0 collapses the pose, since
-                # defaults aren't a stable PD setpoint without the policy driving).
+                # Hold station after a successful drop with walk policy + zero twist: raw action=0 collapses the pose because defaults aren't a stable PD setpoint without the policy driving.
                 stand_twist = torch.zeros(num_envs, 3, device=device_t)
                 stand_obs = _compute_walk_obs(base_env, stand_twist, last_action)
                 stand_action = walk_policy({"actor": stand_obs})
                 action = torch.where(in_post_drop.unsqueeze(-1), stand_action, action)
 
-        # Skip recording for post-drop (stand-still steps aren't skill demos).
-        # Clamp phase to <= DROP_PHASE_ID to stay within the one-hot width (4).
+        # Skip recording in post-drop (stand-still is not a skill demo) and clamp phase to <= DROP_PHASE_ID to stay inside the one-hot width (4).
         record_mask = active & (fsm_state != POST_DROP_PHASE_ID)
         if record_mask.any():
             unified = _unified_obs_per_env(
@@ -748,14 +717,14 @@ def build_dataset_wpcd(
         if grid_writer is not None:
             try:
                 from PIL import Image, ImageDraw, ImageFont
-                _pil_ok = True
-                _font_size = max(18, int(grid_pane_h * 0.045))
+                pil_ok = True
+                font_size = max(18, int(grid_pane_h * 0.045))
                 try:
-                    _font = ImageFont.load_default(size=_font_size)
+                    font = ImageFont.load_default(size=font_size)
                 except TypeError:
-                    _font = ImageFont.load_default()
+                    font = ImageFont.load_default()
             except ImportError:
-                _pil_ok = False
+                pil_ok = False
             panes = []
             for env_i, r_pane in enumerate(grid_renderers):
                 r_pane.update(base_env.sim.data)
@@ -767,14 +736,14 @@ def build_dataset_wpcd(
                     status = "DONE" if bool(drop_done_ever[env_i]) else "STOP"
                 else:
                     status = PHASE_LABELS.get(phase_i, "?")
-                if _pil_ok:
+                if pil_ok:
                     pil = Image.fromarray(img)
                     draw = ImageDraw.Draw(pil)
                     label = f"env{env_i}  {status}  t={step}"
-                    bar_h = int(_font_size * 1.6)
+                    bar_h = int(font_size * 1.6)
                     bar_w = int(grid_pane_w * 0.6)
                     draw.rectangle([(0, 0), (bar_w, bar_h)], fill=(0, 0, 0))
-                    draw.text((10, int(bar_h * 0.15)), label, fill=(255, 255, 255), font=_font)
+                    draw.text((10, int(bar_h * 0.15)), label, fill=(255, 255, 255), font=font)
                     img = np.array(pil)
                 panes.append(img)
             while len(panes) < grid_rows * grid_cols:
@@ -807,20 +776,13 @@ def build_dataset_wpcd(
         )
         pick_stable_counter = torch.where(pick_stable, pick_stable_counter + 1, torch.zeros_like(pick_stable_counter))
         in_pick_counter = torch.where(in_pick, in_pick_counter + 1, torch.zeros_like(in_pick_counter))
-        # Timeout: once the box is lifted and the robot is upright, fire carry after
-        # ~150 steps even if residual velocity never fully settles — otherwise envs
-        # oscillating under the box weight sit in pick forever.
+        # Timeout: once the box is lifted and robot upright, fire carry after ~150 steps even if residual velocity never fully settles; otherwise envs oscillating under the box weight sit in pick forever.
         pick_timeout = in_pick & upright & (box_z > cfg.pick_to_carry_box_z) & (in_pick_counter >= 150)
         carry_fires = in_pick & ((pick_stable & (pick_stable_counter >= 10)) | pick_timeout)
         if carry_fires.any():
             fires_carry_ever |= carry_fires
             fsm_state = torch.where(carry_fires, torch.full_like(fsm_state, CARRY_PHASE_ID), fsm_state)
-            # Snap approach to the cardinal face of t2 (±x or ±y) whose outward
-            # normal best aligns with the t1 direction — never diagonal. Training
-            # had t1 purely on +x of t2 and the robot approached along a cardinal
-            # axis; a diagonal approach would park the robot at a corner, so the
-            # drop fires with box over the edge and tips off. Picking the
-            # dominant axis of (t1 - t2) keeps the drop in its training manifold.
+            # Snap approach to the cardinal face of t2 (±x or ±y) whose outward normal best aligns with the t1 direction, never diagonal: training had t1 purely on +x of t2 with a cardinal-axis approach, so a diagonal would park the robot at a corner and the drop would fire with the box over the edge; picking the dominant axis of (t1 - t2) keeps the drop in its training manifold.
             robot_xy_cf = robot.data.root_link_pos_w[:, :2]
             dxy_t1_t2 = box_world - table2_world_xy
             abs_x = dxy_t1_t2[:, 0].abs()
@@ -835,9 +797,7 @@ def build_dataset_wpcd(
             )
             carry_approach_target_xy[:, 0] = torch.where(carry_fires, new_approach[:, 0], carry_approach_target_xy[:, 0])
             carry_approach_target_xy[:, 1] = torch.where(carry_fires, new_approach[:, 1], carry_approach_target_xy[:, 1])
-            # Plan carry A* from the firing-env robot position to the approach
-            # target, treating both tables as obstacles so carry doesn't walk
-            # straight through table 1 (same arena / robot_r as walk).
+            # Plan carry A* from the firing-env robot position to the approach target with both tables as obstacles (same arena / robot_r as walk) so carry doesn't walk through table 1.
             fire_ids_c = carry_fires.nonzero(as_tuple=False).squeeze(-1).tolist()
             robot_rel_cf_np = (robot_xy_cf - origins_t).detach().cpu().numpy()
             approach_rel_cf_np = (carry_approach_target_xy - origins_t).detach().cpu().numpy()
@@ -865,16 +825,13 @@ def build_dataset_wpcd(
         t2_dir_all = table2_world_xy - robot.data.root_link_pos_w[:, :2]
         t2_ang_all = torch.atan2(t2_dir_all[:, 1], t2_dir_all[:, 0])
         heading_err_t2_all = torch.atan2(torch.sin(t2_ang_all - r_yaw), torch.cos(t2_ang_all - r_yaw))
-        # Drop fire triggered when robot reaches the exact approach target
-        # (0.61 m before table 2 center along locked direction).
+        # Drop fire triggers when robot reaches the exact approach target (0.61 m before table 2 center along locked direction).
         dist_approach_all = torch.linalg.norm(
             carry_approach_target_xy - robot.data.root_link_pos_w[:, :2], dim=-1,
         )
         near_t2_all = in_carry & (dist_approach_all <= 0.20)
         carry_brake_counter = torch.where(near_t2_all, carry_brake_counter + 1, torch.zeros_like(carry_brake_counter))
-        # Drop fire gates match galpão FSM exactly: tighter heading_err and
-        # velocity thresholds so brake has time to settle the robot into the
-        # drop training's zero-velocity, yaw-aligned regime.
+        # Drop-fire gates match the warehouse FSM exactly: tight heading_err + velocity thresholds give brake time to settle the robot into the drop training's zero-velocity, yaw-aligned regime.
         drop_fires = (
             in_carry
             & near_t2_all
@@ -891,33 +848,22 @@ def build_dataset_wpcd(
             fire_mask = drop_fires
             fire_ids_t = fire_mask.nonzero(as_tuple=False).squeeze(-1)
             n_fire = fire_ids_t.numel()
-            # Snap place_target to Table 2's absolute world-frame center (galpão
-            # FSM style). Brake above has tightened heading_err to 0.1 rad so the
-            # base-frame projection of this target is in the drop training jitter.
+            # Snap place_target to Table 2's absolute world-frame center (warehouse FSM style); brake above tightened heading_err to 0.1 rad so the base-frame projection of this target lies inside the drop training jitter.
             place_target_pos_w[:, 0] = torch.where(fire_mask, table2_world_xy[:, 0], place_target_pos_w[:, 0])
             place_target_pos_w[:, 1] = torch.where(fire_mask, table2_world_xy[:, 1], place_target_pos_w[:, 1])
-            # Snap place_target_quat_w to the robot's current yaw-only quat.
-            # Training had the robot always facing +x (identity rotation) with
-            # place_target_quat_w = identity, so the box (held in hands, aligned
-            # with the robot) was pre-aligned to the target. In deployment the
-            # robot faces whichever cardinal direction t2's chosen face dictates;
-            # if we left place_target_quat_w = identity, the drop policy would
-            # see the box 90°/180° off target and try to throw it sideways to
-            # reorient. Matching the quat to the robot's yaw cancels that error.
+            # Snap place_target_quat_w to the robot's current yaw-only quat: training had the robot always facing +x (identity rotation) with place_target_quat_w = identity, so the box held in hands was pre-aligned; at deployment the robot faces whichever cardinal direction t2's chosen face dictates, and leaving quat = identity would make the drop policy see the box 90°/180° off target and try to throw it sideways to reorient. Matching the quat to the robot's yaw cancels that error.
             qw_r, qx_r, qy_r, qz_r = robot.data.root_link_quat_w.unbind(dim=-1)
             yaw_r_now = torch.atan2(2 * (qw_r * qz_r + qx_r * qy_r), 1 - 2 * (qy_r * qy_r + qz_r * qz_r))
             half_r = yaw_r_now / 2
             zero_r = torch.zeros_like(half_r)
             yaw_quat_robot = torch.stack([torch.cos(half_r), zero_r, zero_r, torch.sin(half_r)], dim=-1)
             place_target_quat_w[:] = torch.where(fire_mask.unsqueeze(-1), yaw_quat_robot, place_target_quat_w)
-            # Snapshot current box pose into object_target buffer (training stashes
-            # it at reset; this must stay frozen through the drop phase).
+            # Snapshot current box pose into object_target buffer and freeze it through the drop phase (training stashes it at reset).
             cur_box_pos = base_env.scene["box"].data.root_link_pos_w
             cur_box_quat = base_env.scene["box"].data.root_link_quat_w
             object_target_pos_w[:] = torch.where(fire_mask.unsqueeze(-1), cur_box_pos, object_target_pos_w)
             object_target_quat_w[:] = torch.where(fire_mask.unsqueeze(-1), cur_box_quat, object_target_quat_w)
-            # Only zero velocities + last_action: no teleport of robot or box.
-            # The drop_policy must handle whatever carry-end state we hand it.
+            # Zero velocities + last_action only, no teleport of robot or box: the drop_policy must handle whatever carry-end state we hand it.
             robot.write_root_link_velocity_to_sim(
                 torch.zeros(n_fire, 6, device=device_t), env_ids=fire_ids_t,
             )
@@ -984,11 +930,7 @@ def build_dataset_wpcd(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(str(out_path), unified_obs=unified_arr, action=action_arr, phase=phase_arr)
 
-    # Per-phase outlier check. Sanely trained experts produce actions bounded
-    # by clip_actions~3 and empirically topping out around 25 in the pick
-    # phase. If any phase exceeds OUTLIER_THRESHOLD = 50 the solver likely
-    # went unstable (seen when nconmax/njmax were tightened too aggressively);
-    # downstream BC on this dataset will be dominated by the outliers.
+    # Per-phase outlier check: trained experts produce actions bounded by clip_actions~3, empirically topping out near 25 in pick; a phase exceeding OUTLIER_THRESHOLD = 50 means the solver went unstable (observed with aggressively tightened nconmax/njmax) and downstream BC will be dominated by the outliers.
     OUTLIER_THRESHOLD = 50.0
     phase_names = ["walk", "pick", "carry", "drop", "post"]
     outlier_report: dict[str, dict] = {}
@@ -1029,7 +971,7 @@ def build_dataset_wpcd(
 
 def main() -> None:
     """Parse CLI flags and run the 4-phase batched FSM.
-    Args: reads --num-envs, --out, --device, --seed, --max-steps, --r-min, --r-max, --env-spacing, --carry-steps, --carry-vx, --carry-wz, --drop-z-done from argv.
+    Args: reads `num-envs`, `out`, `device`, `seed`, `max-steps`, `r-min`, `r-max`, `env-spacing`, `carry-approach-dist`, `carry-arrival-dist`, `carry-speed-cap`, `carry-brake-steps`, `drop-z-done`, `video-path` from argv.
     Returns: none.
     """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])

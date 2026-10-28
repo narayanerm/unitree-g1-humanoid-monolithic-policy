@@ -92,7 +92,7 @@ def _override_box_spawn_fsm(
     oy = (2.0 * torch.rand(n, device=device, generator=g) - 1.0) * jitter_y
     env_origins = base_env.scene.env_origins
     cur_pos[:, 0] = env_origins[:, 0] + box_x + ox
-    cur_pos[:, 1] = env_origins[:, 1] + oy  # respawn with our own y jitter around the env origin
+    cur_pos[:, 1] = env_origins[:, 1] + oy  # y jitter around the env origin
     cur_pos[:, 2] = env_origins[:, 2] + BOX_START_Z
     env_ids = torch.arange(n, dtype=torch.int32, device=device)
     box.write_root_link_pose_to_sim(torch.cat([cur_pos, cur_quat], dim=-1), env_ids=env_ids)
@@ -107,7 +107,7 @@ def _random_spawn_annulus(
     Args: box_xy: (N, 2) world box positions; r_min: inner radius (m); r_max: outer radius (m); seed: RNG seed; device: torch device; front_sector_half_width: ignored, kept for backward-compat.
     Returns: (spawn_xy (N, 2), spawn_yaw (N,) uniform in [-pi, pi)).
     """
-    del front_sector_half_width  # kept in signature for backward-compat
+    del front_sector_half_width  # kept in signature for backward compatibility
     n = box_xy.shape[0]
     g = torch.Generator(device=device).manual_seed(int(seed))
     alpha = 2.0 * torch.pi * torch.rand(n, device=device, generator=g)

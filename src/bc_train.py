@@ -1,12 +1,9 @@
-"""Behaviour cloning driver for the unified student.
-
-Input: outputs/walk_pick_sequential.npz (unified_obs, action, phase).
-Output: outputs/logs/g1_monolithic/<timestamp>/model_*.pt plus TensorBoard scalars.
-
-The loss is per-joint MSE on the expert action. Phase-balanced sampling keeps the
-majority phase (walk) from drowning out pick and place. A small held-out split
-produces the validation curve plotted by the companion notebook.
-"""
+##########################################################################################
+# Project    : unitree-g1-humanoid-monolithic-policy                                     #
+# Developer  : Narayane Ribeiro Medeiros                                                 #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
+##########################################################################################
+"""Behaviour cloning driver for the unified student from a walk-pick-place dataset."""
 
 from __future__ import annotations
 
@@ -42,7 +39,10 @@ def _fmt_hms(seconds: float) -> str:
 
 @dataclass
 class BCConfig:
-    """Hyperparameters for the BC loop; the notebook edits fields by name."""
+    """Hyperparameters for the BC loop; the notebook edits fields by name.
+    Args: lr: AdamW learning rate; batch_size: samples per update; epochs: epoch count; val_frac: held-out fraction; balance_phases: enable inverse-frequency sampling; weight_decay: AdamW weight decay; log_every: epochs between stdout lines; save_every: epochs between checkpoints; device: training device.
+    Returns: none.
+    """
     lr: float = 3e-4
     batch_size: int = 4096
     epochs: int = 100
@@ -69,7 +69,7 @@ def _phase_balanced_weights_gpu(
     phase_t: torch.Tensor,
     dataset_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-sample sampling weights on-device for ``torch.multinomial`` phase-balanced sampling.
+    """Per-sample sampling weights on-device for torch.multinomial phase-balanced sampling.
     Args: phase_t: (N,) long tensor of phase ids on the training device; dataset_weights: optional (N,) tensor of per-row weights that overrides inverse-frequency.
     Returns: (N,) float64 tensor of normalized sampling weights.
     """
@@ -97,11 +97,7 @@ def train_bc(
     sample_weights = blob["sample_weights"] if "sample_weights" in blob.files else None
     print(f"[bc] dataset: {obs.shape[0]} transitions, obs={obs.shape[1]}, act={act.shape[1]}" + (" (with sample_weights)" if sample_weights is not None else ""))
 
-    # Drop corrupted samples with absurd action magnitudes before computing
-    # the normalizer or the loss. Sanely trained experts produce actions
-    # bounded by clip_actions~3 and empirically peaking around 25 in pick;
-    # anything over 50 came from an unstable solver run (NaN propagation
-    # through the drop expert's MLP) and would dominate the MSE.
+    # Drop corrupted samples (|action|>50) coming from unstable drop-expert runs before normalizer and loss see them.
     OUTLIER_THRESHOLD = 50.0
     keep = np.abs(act).max(axis=1) < OUTLIER_THRESHOLD
     n_drop = int((~keep).sum())
@@ -117,10 +113,7 @@ def train_bc(
             sample_weights = sample_weights[keep]
         print(f"[bc] dataset after filter: {obs.shape[0]} transitions")
 
-    # Fast path: preload the whole dataset onto the GPU once, then sample
-    # batches on-device via torch.multinomial. Removes the ~1.7 TB of
-    # host-to-device copies the DataLoader path incurred over 1k epochs on a
-    # 1.7 GB dataset. TF32 matmul is enabled for the student MLP.
+    # Preload the full dataset to GPU and sample on-device; removes the host-to-device copy cost the DataLoader path incurred over 1k epochs.
     torch.set_float32_matmul_precision("high")
     device = cfg.device if torch.cuda.is_available() else "cpu"
     print(f"[bc] moving dataset to {device} ({obs.nbytes/1e9 + act.nbytes/1e9:.2f} GB)...", flush=True)

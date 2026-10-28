@@ -27,7 +27,7 @@ from src.policy_walk import TASK_ID as WALK_TASK_ID, register as register_walk
 def main() -> None:
     """Parse CLI args, roll out walk-then-park, write mp4 and print drift stats.
     Args: none (reads argparse from sys.argv).
-    Returns: None.
+    Returns: none.
     """
     ap = argparse.ArgumentParser(description="Walk-then-park rollout: forward twist for N steps, then zero.")
     ap.add_argument("--ckpt", default="experts/walk.pt")
