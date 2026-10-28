@@ -52,14 +52,14 @@ from src.fsm_wpcd_batched import (
     _sample_table2_positions_np,
 )
 from src.goal_features import UNIFIED_ACT_DIM, sample_goal
-from src.ppo_finetune import PPOFinetuneConfig, _PhaseState, _advance_phases_full
+from src.phase_gates import GateConfig, PhaseState, advance_phases_full
 from src.student_policy import MonolithicPolicyStudent
 
 
 def main() -> None:
-    """Parse CLI flags and run the closed-loop student in the wpcd scene.
-    Args: reads --ckpt, --num-envs, --seed, --max-steps, --r-min, --r-max, --t2-r-min, --t2-r-max, --out-video, --device from argv.
-    Returns: none.
+    """Run the closed-loop student rollout in the two-table wpcd scene.
+    Args: reads --ckpt, --num-envs, --seed, --max-steps, --r-min, --r-max, --t2-r-min, --t2-r-max, --out-video, --device from sys.argv.
+    Returns: None. Writes an mp4 grid video to --out-video and prints a per-env summary.
     """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ckpt", required=True, help="Path to a MonolithicPolicyStudent .pt checkpoint")
@@ -110,12 +110,10 @@ def main() -> None:
     table1_world_xy = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
     table2_world_xy = origins_t + torch.from_numpy(table2_rel_xy_np).to(device_t)
 
-    # Load student.
     print(f"[play] loading student from {args.ckpt}...", flush=True)
     student = MonolithicPolicyStudent.load(args.ckpt, device=device)
     student.eval()
 
-    # Spawn + initial goal.
     box_world = base_env.scene["box"].data.root_link_pos_w[:, :2].clone()
     spawn_xy, spawn_yaw = _random_spawn_annulus(box_world, args.r_min, args.r_max, args.seed, device)
     spawn_xy = _resample_spawn_outside_t2(
@@ -130,11 +128,15 @@ def main() -> None:
     _snap_pick_commands_batched(base_env)
 
     goal = sample_goal(args.num_envs, device=device_t, seed=args.seed)
-    state = _PhaseState(args.num_envs, device_t)
+    state = PhaseState(args.num_envs, device_t)
     last_action = torch.zeros(args.num_envs, UNIFIED_ACT_DIM, device=device_t)
 
-    # Phase-gate shared config.
-    ppo_cfg = PPOFinetuneConfig(num_envs=args.num_envs, episode_max_steps=args.max_steps)
+    # Phase-gate shared config (default thresholds mirror the FSM dataset gen).
+    gate_cfg = GateConfig(
+        spawn_r_min=args.r_min, spawn_r_max=args.r_max,
+        table2_r_min=args.t2_r_min, table2_r_max=args.t2_r_max,
+        seed=args.seed,
+    )
 
     # Grid video renderer (one pane per env).
     from mjlab.viewer.offscreen_renderer import OffscreenRenderer
@@ -163,13 +165,12 @@ def main() -> None:
     writer.__enter__()
     try:
         from PIL import Image, ImageDraw, ImageFont
-        _pil_ok = True
-        _font = ImageFont.load_default(size=max(18, int(args.pane_h * 0.045)))
+        pil_ok = True
+        font = ImageFont.load_default(size=max(18, int(args.pane_h * 0.045)))
     except (ImportError, TypeError):
-        _pil_ok = False
-        _font = None
+        pil_ok = False
+        font = None
 
-    # Trajectory stats per env.
     fell = torch.zeros(args.num_envs, dtype=torch.bool, device=device_t)
     max_abs_action = torch.zeros(args.num_envs, device=device_t)
     t_start = time.time()
@@ -185,16 +186,14 @@ def main() -> None:
             action = student(unified)
         max_abs_action = torch.maximum(max_abs_action, action.abs().amax(dim=-1))
 
-        _advance_phases_full(base_env, state, table1_world_xy, table2_world_xy, ppo_cfg, cfg_rc)
+        advance_phases_full(base_env, state, table1_world_xy, table2_world_xy, gate_cfg, cfg_rc)
         _, _, done, extras = env.step(action)
         last_action = action.detach()
 
-        # Fall tracking.
         up_align = -base_env.scene["robot"].data.projected_gravity_b[:, 2]
         new_fell = (up_align < 0.3) & active
         fell = fell | new_fell
 
-        # Progress every 50 steps.
         if step % 50 == 0:
             n_walk = int((state.phase_ids == WALK_PHASE_ID).sum())
             n_pick = int((state.phase_ids == PICK_PHASE_ID).sum())
@@ -207,7 +206,6 @@ def main() -> None:
             eta = (args.max_steps - step - 1) * elapsed / max(1, step + 1)
             print(f"[play] step {step:4d}/{args.max_steps} ({pct:5.1f}%) W={n_walk} P={n_pick} C={n_carry} D={n_drop} DONE={n_done} fell={n_fell} max|a|={float(max_abs_action.max()):.2f} | elapsed={_fmt_hms(elapsed)} eta={_fmt_hms(eta)}", flush=True)
 
-        # Render grid frame.
         panes = []
         for env_i, r_pane in enumerate(grid_renderers):
             r_pane.update(base_env.sim.data)
@@ -217,14 +215,14 @@ def main() -> None:
                 status = "FELL"
             else:
                 status = PHASE_LABELS.get(phase_i, "?")
-            if _pil_ok:
+            if pil_ok:
                 pil = Image.fromarray(img)
                 draw = ImageDraw.Draw(pil)
                 label = f"env{env_i}  {status}  t={step}  |a|={float(max_abs_action[env_i]):.1f}"
-                bar_h = int(_font.size * 1.6)
+                bar_h = int(font.size * 1.6)
                 bar_w = int(args.pane_w * 0.75)
                 draw.rectangle([(0, 0), (bar_w, bar_h)], fill=(0, 0, 0))
-                draw.text((10, int(bar_h * 0.15)), label, fill=(255, 255, 255), font=_font)
+                draw.text((10, int(bar_h * 0.15)), label, fill=(255, 255, 255), font=font)
                 img = np.array(pil)
             panes.append(img)
         while len(panes) < grid_rows * grid_cols:
@@ -237,7 +235,6 @@ def main() -> None:
         r_pane.close()
     base_env.close()
 
-    # Final report.
     print()
     print(f"[play] wrote {out_mp4}")
     print(f"[play] per-env trajectory ({args.num_envs} envs, max_steps={args.max_steps}):")
