@@ -9,9 +9,9 @@
 [![PyTorch](https://img.shields.io/badge/BC-PyTorch-ee4c2c.svg)](https://pytorch.org/)
 
 <p align="center">
-  <img src="docs/demo.gif" width="640" alt="Monolithic student rolling out walk/pick/carry/place end-to-end">
+  <img src="docs/demo.gif" width="560" alt="Monolithic DAgger student rolling out walk to pick to carry on the Unitree G1">
 </p>
-<p align="center"><sub>Grid of 4 BC-student rollouts under randomised spawn (annular distance 0.15 to 5.0 m, uniform angle, uniform initial yaw). <strong>GIF regenerated with <code>scripts/make_portfolio_media.py</code>.</strong></sub></p>
+<p align="center"><sub>DAgger student (round 09) in the two-table WPCD scene, 4 envs under randomised spawn (annular 0.5 to 2.5 m, uniform angle and initial yaw): 4 of 4 envs reach pick, 1 of 4 reaches carry, 1 of 4 falls. Source mp4 in <code>docs/demo.mp4</code>; regenerate with <code>scripts/make_portfolio_media.py</code>.</sub></p>
 
 
 ## What this does
@@ -113,8 +113,13 @@ python -m src.dagger_finetune \
     --bc-ckpt outputs/logs/g1_monolithic/<timestamp>/model_best.pt \
     --bc-dataset outputs/walk_pick_carry_drop_batched.npz \
     --rounds 10 --num-envs 1024 --max-steps 400 \
-    --epochs-per-round 60 --buffer-window 3
+    --epochs-per-round 60 --buffer-window 3 \
+    --pick-reset-fraction 0.0 \
+    --carry-reset-fraction 0.25 \
+    --drop-reset-fraction 0.0
 ```
+
+The three `*-reset-fraction` flags teleport a fraction of envs to a sampled walk-terminal (`--pick-reset-fraction`), carry (`--carry-reset-fraction`), or drop-fire (`--drop-reset-fraction`) snapshot at round start, so the student sees later-phase states even when early-phase failures would otherwise clip the trajectory.
 
 Notebook flags: `DEBUG_LIGHT`, `REUSE_DATASET`, `REUSE_BC`.
 
@@ -194,9 +199,27 @@ outputs/                         Datasets, logs, TensorBoard runs
 
 ## Visual assets
 
+The hero GIF (`docs/demo.gif`) is a two-pass palette encoding of `docs/demo.mp4` at 560 px wide, 10 fps, 6 s to stay under the 6 MB cap recommended for GitHub inline rendering. To regenerate from a fresh rollout:
+
 ```bash
-python scripts/make_portfolio_media.py outputs/media/wpcd_n4_grid_latest.mp4
-# writes docs/demo.gif + docs/frame_map.png
+# 1. Record a 4-env WPCD rollout of the current DAgger checkpoint.
+python scripts/play_student_wpcd.py \
+    --ckpt outputs/logs/g1_monolithic_dagger/<ts>/model_round_<N>.pt \
+    --num-envs 4 --seed 7 --max-steps 800 \
+    --out-video docs/demo.mp4
+
+# 2. Two-pass palette ffmpeg (small file, decent quality).
+ffmpeg -y -ss 1 -t 6 -i docs/demo.mp4 \
+    -vf "fps=10,scale=560:-1:flags=lanczos,palettegen=stats_mode=diff" /tmp/pal.png
+ffmpeg -y -ss 1 -t 6 -i docs/demo.mp4 -i /tmp/pal.png \
+    -lavfi "fps=10,scale=560:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+    docs/demo.gif
+```
+
+For the 4-frame storyboard (`docs/frame_map.png`), run:
+
+```bash
+python scripts/make_portfolio_media.py docs/demo.mp4
 ```
 
 ## Chain
