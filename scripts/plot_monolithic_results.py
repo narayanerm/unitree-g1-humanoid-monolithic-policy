@@ -79,7 +79,7 @@ def main() -> None:
     ax.axhline(v[-1], color="#444444", ls="--", lw=0.8, label=f"end  {v[-1]:+.2f}")
     ax.set_xlabel("PPO iteration")
     ax.set_ylabel("mean reward (total)")
-    ax.set_title("(b) PPO return — does NOT improve on BC")
+    ax.set_title("(b) PPO return: does NOT improve on BC")
     ax.legend(loc="lower left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -103,9 +103,9 @@ def main() -> None:
     # Panel (d): per-iteration FSM transition fires across envs.
     ax = axes[1, 0]
     for tag, color, label in [
-        ("Train/pick_fires_per_iter", "#1f77b4", "walk -> pick"),
-        ("Train/carry_fires_per_iter", "#2ca02c", "pick -> carry"),
-        ("Train/drop_fires_per_iter", "#d62728", "carry -> drop"),
+        ("Train/pick_fires_per_iter", "#1f77b4", "walk to pick"),
+        ("Train/carry_fires_per_iter", "#2ca02c", "pick to carry"),
+        ("Train/drop_fires_per_iter", "#d62728", "carry to drop"),
         ("Train/drops_done_per_iter", "#9467bd", "drop done"),
     ]:
         s, v = ppo[tag]
@@ -113,7 +113,7 @@ def main() -> None:
         ax.plot(s[w-1:], v_ema, color=color, lw=1.4, label=label)
     ax.set_xlabel("PPO iteration")
     ax.set_ylabel("phase transitions / iter (envs)")
-    ax.set_title("(d) Phase fires — only walk -> pick triggers")
+    ax.set_title("(d) Phase fires: only walk to pick triggers")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -144,7 +144,7 @@ def main() -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_ylabel("count / 4 envs (seed=7)")
-    ax.set_title("(f) Play-time outcomes — PPO worse than BC")
+    ax.set_title("(f) Play-time outcomes: PPO worse than BC")
     ax.set_ylim(0, 4.5)
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3, axis="y")

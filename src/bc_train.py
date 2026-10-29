@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from src.student_policy import MonolithicPolicyStudent
 
-# One-hot slot count matching PHASE_ONE_HOT_DIM; sizes the inverse-frequency lookup.
+# Phase count matching PHASE_ONE_HOT_DIM; shapes the per-phase target-share vector.
 NUM_PHASES = 4
 
 
@@ -40,7 +40,7 @@ def _fmt_hms(seconds: float) -> str:
 @dataclass
 class BCConfig:
     """Hyperparameters for the BC loop; the notebook edits fields by name.
-    Args: lr: AdamW learning rate; batch_size: samples per update; epochs: epoch count; val_frac: held-out fraction; balance_phases: enable inverse-frequency sampling; weight_decay: AdamW weight decay; log_every: epochs between stdout lines; save_every: epochs between checkpoints; device: training device.
+    Args: lr: AdamW learning rate; batch_size: samples per update; epochs: epoch count; val_frac: held-out fraction; balance_phases: enable phase-aware sampling; phase_target_weights: per-phase batch share (walk, pick, carry, drop); weight_decay: AdamW weight decay; log_every: epochs between stdout lines; save_every: epochs between checkpoints; device: training device.
     Returns: none.
     """
     lr: float = 3e-4
@@ -48,6 +48,8 @@ class BCConfig:
     epochs: int = 100
     val_frac: float = 0.05
     balance_phases: bool = True
+    # Equal share reproduces inverse-frequency; raise pick/drop entries to overweight transitions.
+    phase_target_weights: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
     weight_decay: float = 1e-5
     log_every: int = 10
     save_every: int = 25
@@ -68,17 +70,24 @@ def _make_split_indices(n: int, val_frac: float, seed: int = 0) -> tuple[np.ndar
 def _phase_balanced_weights_gpu(
     phase_t: torch.Tensor,
     dataset_weights: torch.Tensor | None = None,
+    phase_target_weights: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
 ) -> torch.Tensor:
-    """Per-sample sampling weights on-device for torch.multinomial phase-balanced sampling.
-    Args: phase_t: (N,) long tensor of phase ids on the training device; dataset_weights: optional (N,) tensor of per-row weights that overrides inverse-frequency.
+    """Per-sample sampling weights on-device for torch.multinomial phase-aware sampling.
+    Args: phase_t: (N,) long tensor of phase ids on the training device; dataset_weights: optional (N,) tensor of per-row weights that overrides phase targets; phase_target_weights: per-phase batch share (walk, pick, carry, drop); phases with zero samples lose their share, which is redistributed proportionally to the remaining phases.
     Returns: (N,) float64 tensor of normalized sampling weights.
     """
     if dataset_weights is not None:
         return dataset_weights.double()
+    device = phase_t.device
     counts = torch.bincount(phase_t, minlength=NUM_PHASES).double()
-    counts = counts.clamp(min=1.0)
-    inv_freq = 1.0 / counts
-    return inv_freq[phase_t]
+    target = torch.tensor(phase_target_weights, dtype=torch.float64, device=device)
+    target = target * (counts > 0).double()
+    if target.sum() == 0:
+        raise RuntimeError("[bc] all phases have zero samples; cannot build sampler weights")
+    target = target / target.sum()
+    counts_safe = counts.clamp(min=1.0)
+    per_phase_weight = target / counts_safe
+    return per_phase_weight[phase_t]
 
 
 def train_bc(
@@ -136,7 +145,9 @@ def train_bc(
 
     if cfg.balance_phases:
         sampler_weights = _phase_balanced_weights_gpu(
-            tr_phase, dataset_weights=(weights_full[tr_idx] if weights_full is not None else None),
+            tr_phase,
+            dataset_weights=(weights_full[tr_idx] if weights_full is not None else None),
+            phase_target_weights=cfg.phase_target_weights,
         )
     else:
         sampler_weights = None
@@ -222,7 +233,7 @@ def train_bc(
 
 def main() -> None:
     """Parse CLI flags and train the student on the sequential dataset.
-    Args: none: reads --dataset, --epochs, --lr, --batch-size, --device from argv.
+    Args: reads `--dataset`, `--epochs`, `--lr`, `--batch-size`, `--device` from argv.
     Returns: none.
     """
     import argparse

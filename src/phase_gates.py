@@ -5,8 +5,8 @@
 ##########################################################################################
 """Shared physics gates and per-env state for the walk-pick-carry-drop chain.
 
-Extracted from the original PPO fine-tune module so DAgger and the play scripts
-can both drive the same phase progression without pulling PPO-only machinery.
+Input:  mjlab base env, per-env PhaseState tensors, table 1 / table 2 world positions.
+Output: updated phase ids and boolean fire masks for pick / carry / drop transitions.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from src.fsm_wpcd_batched import (
 
 @dataclass
 class GateConfig:
-    """Physics-gate thresholds + spawn envelope shared by DAgger / play / PPO."""
+    """Physics-gate thresholds and spawn envelope shared by DAgger, play, and PPO."""
     spawn_r_min: float = 1.5
     spawn_r_max: float = 5.0
     table2_r_min: float = 1.5

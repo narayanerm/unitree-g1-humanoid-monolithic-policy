@@ -1,29 +1,9 @@
 ##########################################################################################
 # Project    : unitree-g1-humanoid-monolithic-policy                                     #
 # Developer  : Narayane Ribeiro Medeiros                                                 #
-# Repository : https://github.com/narayanerm/itandroids-academic                         #
+# Repository : https://github.com/narayanerm/unitree-g1-humanoid-monolithic-policy       #
 ##########################################################################################
-"""DAgger fine-tune of the monolithic walk-pick-carry-drop student.
-
-Replaces the earlier PPO fine-tune. For each round the loop:
-
-1. Rolls out the current student in the two-table WPCD env. The env is stepped
-   with the STUDENT's action, so the collected states follow the student's own
-   trajectory distribution (fixes covariate shift that pure BC suffers from).
-2. For every recorded state, queries the FSM oracle: the four frozen expert
-   policies (walk / pick / carry / drop) dispatched by the current phase id,
-   using the same physics gates the FSM data-gen uses. The oracle's action is
-   the DAgger label.
-3. Appends (unified_obs, oracle_action, phase_id) to a per-round .npz under
-   outputs/logs/g1_monolithic_dagger/<timestamp>/round_NN.npz.
-4. Retrains the student by MSE on the BC seed plus the last ``buffer_window``
-   DAgger rounds, warm-starting from the previous checkpoint.
-
-Carry/drop twists are produced by direct pursuit toward the gate-locked
-approach target (no A* re-planning). This loses some planner-level
-cleverness vs. the full FSM but keeps the oracle in-process and cheap enough
-to label every student step.
-"""
+"""DAgger fine-tune of the monolithic walk-pick-carry-drop student against the FSM oracle."""
 
 from __future__ import annotations
 
@@ -82,7 +62,8 @@ class DAggerConfig:
     """Hyperparameters for the DAgger fine-tune."""
     num_envs: int = 1024
     rounds: int = 10
-    episode_max_steps: int = 400
+    # Budget covers worst-case gate traversal (walk+brake+pick+carry+brake+drop ~725 steps).
+    episode_max_steps: int = 1200
     walk_speed_cap: float = 1.0
     carry_speed_cap: float = 0.45
     env_spacing: float = 20.0
@@ -96,31 +77,38 @@ class DAggerConfig:
     bc_lr: float = 3e-4
     bc_weight_decay: float = 1e-5
     balance_phases: bool = True
+    # Target share per phase in each refit batch; empty phases redistribute proportionally.
+    phase_target_weights: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
 
-    # Keep BC seed + last W DAgger rounds for the retrain.
     buffer_window: int = 3
 
     save_every_rounds: int = 1
 
-    # Opt 1: cap BC-seed GPU residency; falls back to disk reload above budget.
+    # Cap BC-seed GPU residency; falls back to disk reload above budget.
     bc_seed_gpu_budget_bytes: int = 2 * 1024 ** 3
-    # Opt 2: AMP is a loss on sm_75 (overhead beats tensor-core gains); keep off by default.
+    # AMP is a loss on sm_75 (overhead beats tensor-core gains); keep off by default.
     use_amp: bool = False
-    # Opt 3: early-stop costs a val pass per epoch; only enable for long refits (>=60 epochs).
+    # Early-stop costs a val pass per epoch; only enable for long refits (>=60 epochs).
     early_stop_patience: int = 0
     early_stop_val_frac: float = 0.05
     early_stop_min_epochs: int = 5
-    # Opt 4: round-0 fit anchors the normaliser stats; freezing afterwards prevents input-scale drift.
+    # Round-0 fit anchors normaliser stats; freezing afterwards prevents input-scale drift.
     freeze_normalizer_after_round_zero: bool = True
+
+    # Scheduled teleport fractions per phase; remainder (1-sum) spawns fresh in walk.
+    carry_reset_fraction: float = 0.25
+    pick_reset_fraction: float = 0.0
+    drop_reset_fraction: float = 0.0
+    carry_snapshot_buffer_size: int = 2048
+    drop_snapshot_buffer_size: int = 1024
+    walk_terminal_buffer_path: str = "outputs/walk_terminal_states.npz"
+
+    # Phase-stratified cap on BC-seed transitions (0 keeps all); for low-VRAM GPUs.
+    bc_seed_max_transitions: int = 0
 
 
 class FSMOracle:
-    """Four-expert dispatcher: produces per-env actions matching the FSM behaviour.
-
-    The oracle is called on the shared env's current state (whatever trajectory
-    the student put it in) and queries the right expert per env according to
-    the phase id advanced by ``advance_phases_full``.
-    """
+    """Four-expert dispatcher producing per-env actions matching the FSM behaviour."""
 
     def __init__(
         self,
@@ -155,7 +143,7 @@ class FSMOracle:
         self._walk_speed_cap = float(walk_speed_cap)
         self._carry_speed_cap = float(carry_speed_cap)
 
-        # Pick expert: runner handles pick-specific obs via the env's observation manager; do not re-wrap base_env (runner only needs clip_actions for its actor normalizer).
+        # Pick runner reads obs through base_env's observation manager; no re-wrapping.
         agent_cfg = load_rl_cfg(PICK_TASK_ID)
         from mjlab.rl import RslRlVecEnvWrapper
         pick_env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
@@ -167,7 +155,7 @@ class FSMOracle:
         self._pick_policy = pick_runner.get_inference_policy(device=device)
         self._pick_env = pick_env
 
-        # Walk / carry / drop: MLP wrappers over the raw state_dicts to avoid building three extra mjlab envs.
+        # Walk/carry/drop as raw MLPs to avoid building three extra mjlab envs.
         self._walk_policy = _load_actor_from_state_dict(
             ckpt_path=resolve_ckpt(BY_NAME["walk"]),
             obs_dim=99, action_dim=29, hidden=(512, 256, 128), device=device,
@@ -194,7 +182,7 @@ class FSMOracle:
             [0.0, -GRASP_NOMINAL_Y, GRASP_NOMINAL_Z], device=device,
         ).expand(num_envs, 3).contiguous()
 
-        # Default place-target z used until drop_fire snaps the per-env target at reset time.
+        # Default place-target z used until drop_fire snaps the per-env target.
         self._table_top_z = TABLE_HEIGHT + TABLE_TOP_HALF
         self._box_half = BOX_HALF
 
@@ -236,7 +224,7 @@ class FSMOracle:
         in_drop = state.phase_ids == DROP_PHASE_ID
         in_post_drop = state.phase_ids == POST_DROP_PHASE_ID
 
-        # Walk: direct pursuit toward the box; the brake near the box is handled by advance_phases_full.
+        # Walk pursues the box; brake handled by advance_phases_full.
         walk_twist = _twist_toward(self._base_env, box_xy_w, self._walk_speed_cap)
         walk_obs = _compute_walk_obs(self._base_env, walk_twist, last_action)
         walk_action = self._walk_policy({"actor": walk_obs})
@@ -270,13 +258,175 @@ class FSMOracle:
             action = torch.where(in_drop.unsqueeze(-1), drop_action, action)
 
         if in_post_drop.any():
-            # Hold station after a successful drop: walk expert with zero twist.
+            # Hold station post-drop with walk expert at zero twist.
             stand_twist = torch.zeros(self._num_envs, 3, device=self._device)
             stand_obs = _compute_walk_obs(self._base_env, stand_twist, last_action)
             stand_action = self._walk_policy({"actor": stand_obs})
             action = torch.where(in_post_drop.unsqueeze(-1), stand_action, action)
 
         return action
+
+
+class CarryStateBuffer:
+    """Circular GPU buffer of physics snapshots taken at phase-fire moments."""
+
+    def __init__(self, capacity: int, num_joints: int, device: str, target_phase_id: int = CARRY_PHASE_ID):
+        """Allocate the circular buffers; the slot write cursor starts at 0 and wraps.
+        Args: capacity: max snapshots retained before oldest overwritten; num_joints: dof count for joint_pos / joint_vel buffers; device: torch device; target_phase_id: phase id to assign on teleport (CARRY or DROP).
+        Returns: none.
+        """
+        self.capacity = capacity
+        self.device = device
+        self.target_phase_id = target_phase_id
+        self.n_filled = 0
+        self.cursor = 0
+        self.robot_pose = torch.zeros(capacity, 7, device=device)
+        self.robot_vel = torch.zeros(capacity, 6, device=device)
+        self.joint_pos = torch.zeros(capacity, num_joints, device=device)
+        self.joint_vel = torch.zeros(capacity, num_joints, device=device)
+        self.box_pose = torch.zeros(capacity, 7, device=device)
+        self.box_vel = torch.zeros(capacity, 6, device=device)
+        self.approach_xy = torch.zeros(capacity, 2, device=device)
+        self.place_target_pos_w = torch.zeros(capacity, 3, device=device)
+        self.place_target_quat_w = torch.zeros(capacity, 4, device=device)
+        self.place_target_quat_w[:, 0] = 1.0
+        self.object_target_pos_w = torch.zeros(capacity, 3, device=device)
+        self.object_target_quat_w = torch.zeros(capacity, 4, device=device)
+        self.object_target_quat_w[:, 0] = 1.0
+
+    def size(self) -> int:
+        """Return the number of snapshots currently stored (<= capacity).
+        Args: none.
+        Returns: current fill level.
+        """
+        return self.n_filled
+
+    def add_from_env(self, base_env, state: PhaseState, env_ids: torch.Tensor) -> None:
+        """Snapshot physics + locked approach + locked place/object targets for env_ids into the next free slots.
+        Args: base_env: mjlab env; state: current PhaseState (reads approach_target_xy, place/object_target_*); env_ids: 1-D long tensor of envs whose state should be captured.
+        Returns: none.
+        """
+        n = int(env_ids.numel())
+        if n == 0:
+            return
+        robot = base_env.scene["robot"]
+        box = base_env.scene["box"]
+        pose = torch.cat([robot.data.root_link_pos_w, robot.data.root_link_quat_w], dim=-1)[env_ids]
+        vel = torch.cat([robot.data.root_link_lin_vel_w, robot.data.root_link_ang_vel_w], dim=-1)[env_ids]
+        jp = robot.data.joint_pos[env_ids].clone()
+        jv = robot.data.joint_vel[env_ids].clone()
+        bp = torch.cat([box.data.root_link_pos_w, box.data.root_link_quat_w], dim=-1)[env_ids]
+        bv = torch.cat([box.data.root_link_lin_vel_w, box.data.root_link_ang_vel_w], dim=-1)[env_ids]
+        at = state.approach_target_xy[env_ids].clone()
+        pt_pos = state.place_target_pos_w[env_ids].clone()
+        pt_quat = state.place_target_quat_w[env_ids].clone()
+        ot_pos = state.object_target_pos_w[env_ids].clone()
+        ot_quat = state.object_target_quat_w[env_ids].clone()
+        for i in range(n):
+            slot = self.cursor
+            self.robot_pose[slot] = pose[i]
+            self.robot_vel[slot] = vel[i]
+            self.joint_pos[slot] = jp[i]
+            self.joint_vel[slot] = jv[i]
+            self.box_pose[slot] = bp[i]
+            self.box_vel[slot] = bv[i]
+            self.approach_xy[slot] = at[i]
+            self.place_target_pos_w[slot] = pt_pos[i]
+            self.place_target_quat_w[slot] = pt_quat[i]
+            self.object_target_pos_w[slot] = ot_pos[i]
+            self.object_target_quat_w[slot] = ot_quat[i]
+            self.cursor = (self.cursor + 1) % self.capacity
+            if self.n_filled < self.capacity:
+                self.n_filled += 1
+
+    def teleport_into(self, base_env, state: PhaseState, env_ids: torch.Tensor, buf_idx: torch.Tensor) -> None:
+        """Overwrite the physics + phase + locked-target state of env_ids with the snapshots at buf_idx.
+        Args: base_env: mjlab env; state: PhaseState to mutate (sets phase_ids=target_phase_id and copies approach / place / object targets); env_ids: 1-D long tensor of envs to overwrite; buf_idx: 1-D long tensor of snapshot indices (same length as env_ids).
+        Returns: none.
+        """
+        n = int(env_ids.numel())
+        if n == 0 or self.n_filled == 0:
+            return
+        robot = base_env.scene["robot"]
+        box = base_env.scene["box"]
+        env_ids_i32 = env_ids.to(torch.int32)
+        robot.write_root_link_pose_to_sim(self.robot_pose[buf_idx], env_ids=env_ids_i32)
+        robot.write_root_link_velocity_to_sim(self.robot_vel[buf_idx], env_ids=env_ids_i32)
+        robot.write_joint_state_to_sim(self.joint_pos[buf_idx], self.joint_vel[buf_idx], env_ids=env_ids_i32)
+        box.write_root_link_pose_to_sim(self.box_pose[buf_idx], env_ids=env_ids_i32)
+        box.write_root_link_velocity_to_sim(self.box_vel[buf_idx], env_ids=env_ids_i32)
+        state.phase_ids[env_ids] = self.target_phase_id
+        state.approach_target_xy[env_ids] = self.approach_xy[buf_idx]
+        state.place_target_pos_w[env_ids] = self.place_target_pos_w[buf_idx]
+        state.place_target_quat_w[env_ids] = self.place_target_quat_w[buf_idx]
+        state.object_target_pos_w[env_ids] = self.object_target_pos_w[buf_idx]
+        state.object_target_quat_w[env_ids] = self.object_target_quat_w[buf_idx]
+        state.brake_counter[env_ids] = 0
+        state.pick_stable_counter[env_ids] = 0
+        state.in_pick_counter[env_ids] = 0
+        state.carry_brake_counter[env_ids] = 0
+        state.drop_done_ever[env_ids] = False
+
+
+class WalkTerminalBuffer:
+    """Loader and teleport helper for a pre-generated walk_terminal_states.npz."""
+
+    def __init__(self, buffer_path: str, device: str):
+        """Load the walk buffer npz into GPU tensors.
+        Args: buffer_path: path to walk_terminal_states.npz (produced by src.collect_buffer with walk policy); device: torch device.
+        Returns: none; raises FileNotFoundError if the buffer file does not exist.
+        """
+        import numpy as np
+        self.device = device
+        p = Path(buffer_path)
+        if not p.exists():
+            raise FileNotFoundError(
+                f"walk terminal buffer not found at {p.resolve()}; "
+                f"run: python -m src.collect_buffer --policy-module src.policy_walk --checkpoint <walk_ckpt> --out {p}"
+            )
+        arr = np.load(str(p))
+        self.joint_pos = torch.from_numpy(arr["joint_pos"]).float().to(device)
+        self.joint_vel = torch.from_numpy(arr["joint_vel"]).float().to(device)
+        self.root_z = torch.from_numpy(arr["root_z"]).float().to(device)
+        self.quat = torch.from_numpy(arr["quat_zy"]).float().to(device)
+        self.lin_vel = torch.from_numpy(arr["lin_vel_by"]).float().to(device)
+        self.ang_vel = torch.from_numpy(arr["ang_vel_by"]).float().to(device)
+        self.n = self.joint_pos.shape[0]
+
+    def size(self) -> int:
+        """Return the number of walk-terminal snapshots in the file.
+        Args: none.
+        Returns: integer count.
+        """
+        return self.n
+
+    def teleport_into(self, base_env, state: PhaseState, env_ids: torch.Tensor, buf_idx: torch.Tensor, table1_world_xy: torch.Tensor) -> None:
+        """Teleport env_ids robots to sampled walk-end poses and schedule pick-phase handoff.
+        Args: base_env: mjlab env; state: PhaseState to mutate (sets phase_ids=PICK, zeros per-env counters); env_ids: 1-D long tensor of envs to overwrite; buf_idx: 1-D long tensor of walk-buffer indices (same length as env_ids); table1_world_xy: (num_envs, 2) world XY of the pick table so robot pose stays within reach of the box.
+        Returns: none.
+        """
+        n = int(env_ids.numel())
+        if n == 0:
+            return
+        robot = base_env.scene["robot"]
+        env_ids_i32 = env_ids.to(torch.int32)
+        env_origins = base_env.scene.env_origins[env_ids]
+        # 0.3 m pre-pick stance behind table1 keeps the robot within pick-command reach.
+        pick_offset_xy = torch.zeros(n, 2, device=self.device)
+        pick_offset_xy[:, 0] = -0.3
+        root_xy_w = table1_world_xy[env_ids] + pick_offset_xy
+        root_z_w = self.root_z[buf_idx].squeeze(-1) + env_origins[:, 2]
+        pose = torch.cat([root_xy_w, root_z_w.unsqueeze(-1), self.quat[buf_idx]], dim=-1)
+        vel = torch.cat([self.lin_vel[buf_idx], self.ang_vel[buf_idx]], dim=-1)
+        robot.write_root_link_pose_to_sim(pose, env_ids=env_ids_i32)
+        robot.write_root_link_velocity_to_sim(vel, env_ids=env_ids_i32)
+        robot.write_joint_state_to_sim(self.joint_pos[buf_idx], self.joint_vel[buf_idx], env_ids=env_ids_i32)
+        state.phase_ids[env_ids] = PICK_PHASE_ID
+        state.brake_counter[env_ids] = 0
+        state.pick_stable_counter[env_ids] = 0
+        state.in_pick_counter[env_ids] = 0
+        state.carry_brake_counter[env_ids] = 0
+        state.drop_done_ever[env_ids] = False
 
 
 def _rollout_round(
@@ -293,14 +443,58 @@ def _rollout_round(
     table1_world_xy: torch.Tensor,
     table2_world_xy: torch.Tensor,
     seed_offset: int,
+    carry_buffer: Optional[CarryStateBuffer] = None,
+    drop_buffer: Optional[CarryStateBuffer] = None,
+    walk_buffer: Optional[WalkTerminalBuffer] = None,
+    enable_phase_resets: bool = False,
 ) -> dict:
     """Collect one DAgger round: step the env with the student, label with the oracle.
-    Args: student: current MonolithicPolicyStudent (eval mode); oracle: FSMOracle; base_env: mjlab env; env: RslRlVecEnvWrapper around base_env; goal: UnifiedGoal struct used in the obs; state: PhaseState (mutated in place); last_action: (N, 29) rolling previous student action (mutated in place); ep_step: (N,) per-env step counter (mutated); cfg: DAggerConfig; rollout_cfg: shared RolloutConfig; table1_world_xy / table2_world_xy: fixed world positions; seed_offset: integer that shifts per-reset seeding so successive rounds respawn differently.
+    Args: student: current MonolithicPolicyStudent (eval mode); oracle: FSMOracle; base_env: mjlab env; env: RslRlVecEnvWrapper around base_env; goal: UnifiedGoal struct used in the obs; state: PhaseState (mutated in place); last_action: (N, 29) rolling previous student action (mutated in place); ep_step: (N,) per-env step counter (mutated); cfg: DAggerConfig; rollout_cfg: shared RolloutConfig; table1_world_xy / table2_world_xy: fixed world positions; seed_offset: integer shift for per-reset seeding; carry_buffer: in-memory snapshots at carry_fires (teleport sets phase=CARRY); drop_buffer: in-memory snapshots at drop_fires (teleport sets phase=DROP); walk_buffer: file-backed walk-terminal poses (teleport sets phase=PICK); enable_phase_resets: if True, apply the three per-phase reset fractions at the start of the round.
     Returns: dict with obs/action/phase arrays (on CPU) plus phase-fire counters.
     """
     device = base_env.scene["robot"].data.root_link_pos_w.device
     N = cfg.num_envs
     T = cfg.episode_max_steps
+
+    # Teleport fractions of envs into deeper phases so the oracle labels pick/carry/drop states.
+    n_pick_reset = 0
+    n_carry_reset = 0
+    n_drop_reset = 0
+    if enable_phase_resets:
+        all_perm = torch.randperm(N, device=device).to(torch.long)
+        cursor = 0
+
+        if walk_buffer is not None and walk_buffer.size() > 0 and cfg.pick_reset_fraction > 0.0:
+            n_pick_reset = min(int(N * cfg.pick_reset_fraction), N - cursor)
+            if n_pick_reset > 0:
+                reset_ids = all_perm[cursor:cursor + n_pick_reset]
+                buf_idx = torch.randint(0, walk_buffer.size(), (n_pick_reset,), device=device)
+                walk_buffer.teleport_into(base_env, state, reset_ids, buf_idx, table1_world_xy)
+                last_action[reset_ids] = 0.0
+                ep_step[reset_ids] = 0
+                cursor += n_pick_reset
+                # Refresh pick-cmd buffers so they reflect the teleported pose.
+                _snap_pick_commands_batched(base_env, env_ids=reset_ids)
+
+        if carry_buffer is not None and carry_buffer.size() > 0 and cfg.carry_reset_fraction > 0.0:
+            n_carry_reset = min(int(N * cfg.carry_reset_fraction), N - cursor)
+            if n_carry_reset > 0:
+                reset_ids = all_perm[cursor:cursor + n_carry_reset]
+                buf_idx = torch.randint(0, carry_buffer.size(), (n_carry_reset,), device=device)
+                carry_buffer.teleport_into(base_env, state, reset_ids, buf_idx)
+                last_action[reset_ids] = 0.0
+                ep_step[reset_ids] = 0
+                cursor += n_carry_reset
+
+        if drop_buffer is not None and drop_buffer.size() > 0 and cfg.drop_reset_fraction > 0.0:
+            n_drop_reset = min(int(N * cfg.drop_reset_fraction), N - cursor)
+            if n_drop_reset > 0:
+                reset_ids = all_perm[cursor:cursor + n_drop_reset]
+                buf_idx = torch.randint(0, drop_buffer.size(), (n_drop_reset,), device=device)
+                drop_buffer.teleport_into(base_env, state, reset_ids, buf_idx)
+                last_action[reset_ids] = 0.0
+                ep_step[reset_ids] = 0
+                cursor += n_drop_reset
 
     obs_rec: list[torch.Tensor] = []
     act_rec: list[torch.Tensor] = []
@@ -316,7 +510,7 @@ def _rollout_round(
     t_start = time.time()
 
     for t in range(T):
-        # Record phase BEFORE the oracle advances it so (obs, action, phase) describe the same step.
+        # Snapshot phase before advance so (obs, action, phase) describe the same step.
         unified = _unified_obs_per_env(
             base_env, state.phase_ids.clamp(max=DROP_PHASE_ID), goal, last_action,
         )
@@ -336,6 +530,13 @@ def _rollout_round(
                 base_env,
                 env_ids=fires["pick_fires"].nonzero(as_tuple=False).squeeze(-1),
             )
+        # Capture carry/drop poses so later rounds can teleport straight into those phases.
+        if carry_buffer is not None and fires["carry_fires"].any():
+            carry_ids = fires["carry_fires"].nonzero(as_tuple=False).squeeze(-1).to(torch.long)
+            carry_buffer.add_from_env(base_env, state, carry_ids)
+        if drop_buffer is not None and fires["drop_fires"].any():
+            drop_ids = fires["drop_fires"].nonzero(as_tuple=False).squeeze(-1).to(torch.long)
+            drop_buffer.add_from_env(base_env, state, drop_ids)
 
         oracle_action = oracle(state, last_action)
         obs_rec.append(unified.detach().cpu())
@@ -384,6 +585,11 @@ def _rollout_round(
         "drop_fires": drop_fires_total,
         "drops_done": drops_done_total,
         "falls": falls_total,
+        "n_pick_reset": n_pick_reset,
+        "n_carry_reset": n_carry_reset,
+        "n_drop_reset": n_drop_reset,
+        "carry_buffer_size": (carry_buffer.size() if carry_buffer is not None else 0),
+        "drop_buffer_size": (drop_buffer.size() if drop_buffer is not None else 0),
         "wall_s": wall_s,
     }
 
@@ -418,7 +624,7 @@ def _train_bc_round(
 
     OUTLIER = 50.0
 
-    # Round data: always fresh from disk (small, grows with the window).
+    # Round data loaded fresh from disk (small, grows with window).
     round_obs_list, round_act_list, round_phase_list = [], [], []
     for p in round_paths:
         blob = np.load(str(p))
@@ -432,7 +638,7 @@ def _train_bc_round(
         round_act_list.append(torch.from_numpy(a[keep]).float().to(device, non_blocking=True))
         round_phase_list.append(torch.from_numpy(ph[keep]).to(device, non_blocking=True))
 
-    # BC seed: use the pre-cached GPU copy if we have it (opt 1); otherwise load now.
+    # Use the pre-cached GPU seed when available; otherwise reload from disk.
     if bc_seed_tensors is not None:
         seed_obs = bc_seed_tensors["obs"]
         seed_act = bc_seed_tensors["act"]
@@ -456,7 +662,7 @@ def _train_bc_round(
           f"(seed cached={bc_seed_tensors is not None}, round files={len(round_paths)})", flush=True)
 
     student = MonolithicPolicyStudent.load(str(warmstart_ckpt), device=device)
-    # Opt 4: update normaliser only on round 0 to avoid drifting the input scale as the student distribution shifts.
+    # Freeze normaliser after round 0 so input scale does not drift with student distribution.
     if round_idx == 0 or not cfg.freeze_normalizer_after_round_zero:
         student.normalizer.update(obs_t)
     student.train()
@@ -464,7 +670,7 @@ def _train_bc_round(
     optim = torch.optim.AdamW(student.parameters(), lr=cfg.bc_lr, weight_decay=cfg.bc_weight_decay)
     loss_fn = nn.MSELoss()
 
-    # Opt 3: pay the val cost (held-out slice + per-epoch forward pass) only when early stop is enabled.
+    # Pay the held-out val cost only when early stop is enabled.
     n_all = obs_t.shape[0]
     use_early_stop = cfg.early_stop_patience > 0
     if use_early_stop:
@@ -482,13 +688,19 @@ def _train_bc_round(
     n_tr = tr_obs.shape[0]
 
     if cfg.balance_phases:
-        counts = torch.bincount(tr_phase, minlength=4).double().clamp(min=1.0)
-        inv_freq = 1.0 / counts
-        sampler_weights = inv_freq[tr_phase]
+        counts = torch.bincount(tr_phase, minlength=4).double()
+        # Phases with no samples get zero target share before renormalisation.
+        target = torch.tensor(cfg.phase_target_weights, dtype=torch.float64, device=device)
+        target = target * (counts > 0).double()
+        if target.sum() == 0:
+            raise RuntimeError("[dagger] all phases have zero samples; cannot build sampler weights")
+        target = target / target.sum()
+        counts_safe = counts.clamp(min=1.0)
+        per_phase_weight = target / counts_safe
+        sampler_weights = per_phase_weight[tr_phase]
     else:
         sampler_weights = None
 
-    # Opt 2: autocast dtype + grad scaler for fp16 (sm_75), bf16 (sm_80+).
     amp_dtype = _pick_amp_dtype(device) if cfg.use_amp else None
     scaler = torch.amp.GradScaler("cuda") if (amp_dtype == torch.float16) else None
 
@@ -517,7 +729,8 @@ def _train_bc_round(
                     nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
                     scaler.step(optim)
                     scaler.update()
-                else:  # bf16 doesn't need the scaler
+                else:
+                    # bf16 skips the grad scaler.
                     loss.backward()
                     nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
                     optim.step()
@@ -530,7 +743,6 @@ def _train_bc_round(
             epoch_loss_sum = epoch_loss_sum + loss.detach() * cfg.bc_batch_size
         train_loss = (epoch_loss_sum / max(1, batches_per_epoch * cfg.bc_batch_size)).item()
 
-        # Validation pass is only run when early-stop is enabled.
         val_loss = float("nan")
         if use_early_stop:
             student.eval()
@@ -611,7 +823,7 @@ def dagger_finetune(
     writer = SummaryWriter(str(log_dir))
     print(f"[dagger] log dir: {log_dir}", flush=True)
 
-    # Pick scene with per-env table 2 (walk+pick+carry+drop chain), same layout fsm_wpcd_batched builds.
+    # Pick scene with per-env table 2 (WPCD chain), same layout as fsm_wpcd_batched.
     register_pick()
     env_cfg = load_env_cfg(PICK_TASK_ID, play=True)
     env_cfg.scene.num_envs = cfg.num_envs
@@ -633,7 +845,6 @@ def dagger_finetune(
     table2_rel_torch = torch.from_numpy(table2_rel_xy_np).to(device)
     table2_world_xy = origins_t + table2_rel_torch
 
-    # Oracle: loads the four frozen experts in-process.
     print("[dagger] loading FSM oracle (walk/pick/carry/drop experts)...", flush=True)
     oracle = FSMOracle(
         base_env=base_env,
@@ -655,31 +866,84 @@ def dagger_finetune(
     _snap_pick_commands_batched(base_env)
     ep_step = torch.zeros(cfg.num_envs, dtype=torch.long, device=device)
 
-    # Seed default place-target z so the drop expert has valid obs before the first drop_fire snaps per-env values.
+    # Seed default place-target z so the drop expert has valid obs before the first drop_fire.
     default_place = oracle.default_place_target(table2_world_xy)
     state.place_target_pos_w.copy_(default_place)
+
+    num_joints = base_env.scene["robot"].data.joint_pos.shape[-1]
+    carry_buffer = CarryStateBuffer(
+        capacity=cfg.carry_snapshot_buffer_size,
+        num_joints=num_joints, device=device, target_phase_id=CARRY_PHASE_ID,
+    ) if cfg.carry_reset_fraction > 0.0 else None
+    drop_buffer = CarryStateBuffer(
+        capacity=cfg.drop_snapshot_buffer_size,
+        num_joints=num_joints, device=device, target_phase_id=DROP_PHASE_ID,
+    ) if cfg.drop_reset_fraction > 0.0 else None
+    walk_buffer: Optional[WalkTerminalBuffer] = None
+    if cfg.pick_reset_fraction > 0.0:
+        try:
+            walk_buffer = WalkTerminalBuffer(cfg.walk_terminal_buffer_path, device=device)
+        except FileNotFoundError as e:
+            print(f"[dagger] pick_reset_fraction={cfg.pick_reset_fraction} but {e}; disabling pick reset", flush=True)
+            walk_buffer = None
+    if carry_buffer is not None or drop_buffer is not None or walk_buffer is not None:
+        total_fraction = cfg.pick_reset_fraction + cfg.carry_reset_fraction + cfg.drop_reset_fraction
+        if total_fraction > 1.0:
+            raise ValueError(f"pick+carry+drop reset fractions sum to {total_fraction:.3f}, must be <= 1.0")
+        print(f"[dagger] phase resets per round: pick={cfg.pick_reset_fraction} ({int(cfg.num_envs * cfg.pick_reset_fraction)} envs), "
+              f"carry={cfg.carry_reset_fraction} ({int(cfg.num_envs * cfg.carry_reset_fraction)} envs), "
+              f"drop={cfg.drop_reset_fraction} ({int(cfg.num_envs * cfg.drop_reset_fraction)} envs), "
+              f"walk={1.0 - total_fraction:.2f} (fresh)",
+              flush=True)
 
     cur_ckpt = Path(bc_ckpt)
     round_npz_paths: list[Path] = []
     bc_seed_path = Path(bc_dataset)
     assert bc_seed_path.exists(), f"BC seed dataset not found: {bc_seed_path}"
 
-    # Opt 1: pre-load the BC seed onto the GPU once; fall back to disk loading if it exceeds the budget.
+    # Pre-load the BC seed to GPU once; fall back to per-round disk reload above budget.
     bc_seed_tensors: Optional[dict] = None
     outlier = 50.0
     blob = np.load(str(bc_seed_path))
-    nbytes = blob["unified_obs"].nbytes + blob["action"].nbytes + blob["phase"].nbytes
+    a = blob["action"]
+    o = blob["unified_obs"]
+    ph = blob["phase"].astype(np.int64)
+    keep = np.abs(a).max(axis=1) < outlier
+    if (~keep).any():
+        print(f"[dagger] filtered {int((~keep).sum())} BC seed outlier transitions")
+    a, o, ph = a[keep], o[keep], ph[keep]
+
+    # Phase-stratified subsample for low-VRAM machines.
+    if cfg.bc_seed_max_transitions > 0 and len(a) > cfg.bc_seed_max_transitions:
+        rng = np.random.default_rng(cfg.rollout_seed)
+        counts_src = np.array([int((ph == p).sum()) for p in range(4)])
+        totals = counts_src.sum()
+        target_per_phase = np.zeros(4, dtype=np.int64)
+        for p in range(4):
+            target_per_phase[p] = max(1, int(round(cfg.bc_seed_max_transitions * counts_src[p] / totals)))
+        # Correct rounding drift against the exact cap.
+        delta = int(target_per_phase.sum()) - cfg.bc_seed_max_transitions
+        if delta != 0:
+            step = -1 if delta > 0 else 1
+            for _ in range(abs(delta)):
+                target_per_phase[int(target_per_phase.argmax())] += step
+        pick_idx = []
+        for p in range(4):
+            src = np.where(ph == p)[0]
+            if len(src) > 0:
+                take = min(target_per_phase[p], len(src))
+                pick_idx.append(rng.choice(src, size=take, replace=False))
+        pick_idx = np.concatenate(pick_idx)
+        rng.shuffle(pick_idx)
+        a, o, ph = a[pick_idx], o[pick_idx], ph[pick_idx]
+        print(f"[dagger] subsampled BC seed to {len(a)} transitions (cap={cfg.bc_seed_max_transitions})", flush=True)
+
+    nbytes = a.nbytes + o.nbytes + ph.nbytes
     if nbytes <= cfg.bc_seed_gpu_budget_bytes:
-        a = blob["action"]
-        o = blob["unified_obs"]
-        ph = blob["phase"].astype(np.int64)
-        keep = np.abs(a).max(axis=1) < outlier
-        if (~keep).any():
-            print(f"[dagger] filtered {int((~keep).sum())} BC seed outlier transitions")
         bc_seed_tensors = {
-            "obs": torch.from_numpy(o[keep]).float().to(device, non_blocking=True),
-            "act": torch.from_numpy(a[keep]).float().to(device, non_blocking=True),
-            "phase": torch.from_numpy(ph[keep]).to(device, non_blocking=True),
+            "obs": torch.from_numpy(o).float().to(device, non_blocking=True),
+            "act": torch.from_numpy(a).float().to(device, non_blocking=True),
+            "phase": torch.from_numpy(ph).to(device, non_blocking=True),
         }
         print(f"[dagger] cached BC seed on GPU: "
               f"{bc_seed_tensors['obs'].shape[0]} transitions, "
@@ -688,12 +952,12 @@ def dagger_finetune(
         print(f"[dagger] BC seed is {nbytes/1e6:.0f} MB > budget "
               f"{cfg.bc_seed_gpu_budget_bytes/1e6:.0f} MB; will reload per round "
               f"(bump cfg.bc_seed_gpu_budget_bytes if VRAM allows)", flush=True)
-    del blob
+    del blob, a, o, ph
 
     t_run_start = time.time()
     for round_idx in range(cfg.rounds):
         t_round_start = time.time()
-        print(f"\n[dagger] ======= ROUND {round_idx + 1}/{cfg.rounds} =======", flush=True)
+        print(f"\n[dagger] round {round_idx + 1}/{cfg.rounds}", flush=True)
 
         print(f"[dagger] rolling out student ({cfg.num_envs} envs x {cfg.episode_max_steps} steps)...", flush=True)
         student = MonolithicPolicyStudent.load(str(cur_ckpt), device=device)
@@ -712,6 +976,10 @@ def dagger_finetune(
             table1_world_xy=table1_world_xy,
             table2_world_xy=table2_world_xy,
             seed_offset=1 + round_idx * 1000,
+            carry_buffer=carry_buffer,
+            drop_buffer=drop_buffer,
+            walk_buffer=walk_buffer,
+            enable_phase_resets=(round_idx > 0),
         )
         rollout_s = round_stats["wall_s"]
         n_trans = round_stats["unified_obs"].shape[0]
@@ -719,7 +987,9 @@ def dagger_finetune(
             f"[dagger] round {round_idx} rollout: {n_trans} transitions in {_fmt_hms(rollout_s)} "
             f"(pick_fires={round_stats['pick_fires']}, carry_fires={round_stats['carry_fires']}, "
             f"drop_fires={round_stats['drop_fires']}, drops_done={round_stats['drops_done']}, "
-            f"falls={round_stats['falls']})",
+            f"falls={round_stats['falls']}, resets p={round_stats['n_pick_reset']}/"
+            f"c={round_stats['n_carry_reset']}/d={round_stats['n_drop_reset']}, "
+            f"bufs c={round_stats['carry_buffer_size']}/d={round_stats['drop_buffer_size']})",
             flush=True,
         )
         writer.add_scalar("Rollout/pick_fires", round_stats["pick_fires"], round_idx)
@@ -728,6 +998,11 @@ def dagger_finetune(
         writer.add_scalar("Rollout/drops_done", round_stats["drops_done"], round_idx)
         writer.add_scalar("Rollout/falls", round_stats["falls"], round_idx)
         writer.add_scalar("Rollout/transitions", n_trans, round_idx)
+        writer.add_scalar("Rollout/n_pick_reset", round_stats["n_pick_reset"], round_idx)
+        writer.add_scalar("Rollout/n_carry_reset", round_stats["n_carry_reset"], round_idx)
+        writer.add_scalar("Rollout/n_drop_reset", round_stats["n_drop_reset"], round_idx)
+        writer.add_scalar("Rollout/carry_buffer_size", round_stats["carry_buffer_size"], round_idx)
+        writer.add_scalar("Rollout/drop_buffer_size", round_stats["drop_buffer_size"], round_idx)
         writer.add_scalar("Perf/rollout_s", rollout_s, round_idx)
 
         round_npz = log_dir / f"round_{round_idx:02d}.npz"
@@ -758,7 +1033,7 @@ def dagger_finetune(
         print(f"[dagger] round {round_idx} wall time: {_fmt_hms(round_s)}; current ckpt: {cur_ckpt}", flush=True)
 
         if round_idx > 0 and len(round_npz_paths) > cfg.buffer_window:
-            # Delete rounds that fall outside the sliding window to keep disk use bounded.
+            # Drop files outside the sliding window to bound disk use.
             to_del = round_npz_paths[:-cfg.buffer_window]
             for p in to_del:
                 if p.exists():
@@ -773,7 +1048,7 @@ def dagger_finetune(
 
 def main() -> None:
     """Parse CLI flags and run DAgger starting from a given BC checkpoint.
-    Args: reads --bc-ckpt, --bc-dataset, --rounds, --num-envs, --max-steps, --epochs-per-round, --device from argv.
+    Args: reads --bc-ckpt, --bc-dataset, --rounds, --num-envs, --max-steps, --epochs-per-round, --buffer-window, --carry-reset-fraction, --device from argv.
     Returns: none.
     """
     import argparse
@@ -783,9 +1058,15 @@ def main() -> None:
     ap.add_argument("--bc-dataset", required=True)
     ap.add_argument("--rounds", type=int, default=10)
     ap.add_argument("--num-envs", type=int, default=1024)
-    ap.add_argument("--max-steps", type=int, default=400)
+    ap.add_argument("--max-steps", type=int, default=1200)
     ap.add_argument("--epochs-per-round", type=int, default=60)
     ap.add_argument("--buffer-window", type=int, default=3)
+    ap.add_argument("--carry-reset-fraction", type=float, default=0.25,
+                    help="fraction of envs teleported to a sampled carry pose at round start")
+    ap.add_argument("--pick-reset-fraction", type=float, default=0.0,
+                    help="fraction of envs teleported to a sampled walk-terminal pose at round start")
+    ap.add_argument("--drop-reset-fraction", type=float, default=0.0,
+                    help="fraction of envs teleported to a sampled drop-fire snapshot at round start")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
@@ -795,6 +1076,9 @@ def main() -> None:
         episode_max_steps=args.max_steps,
         epochs_per_round=args.epochs_per_round,
         buffer_window=args.buffer_window,
+        carry_reset_fraction=args.carry_reset_fraction,
+        pick_reset_fraction=args.pick_reset_fraction,
+        drop_reset_fraction=args.drop_reset_fraction,
         device=args.device,
     )
     dagger_finetune(args.bc_ckpt, args.bc_dataset, cfg=cfg)
