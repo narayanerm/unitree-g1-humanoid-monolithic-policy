@@ -50,6 +50,10 @@ class BCConfig:
     balance_phases: bool = True
     # Equal share reproduces inverse-frequency; raise pick/drop entries to overweight transitions.
     phase_target_weights: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
+    # Multinomial sampling can draw 0 rows for a small-pool phase in a batch; stratified guarantees coverage.
+    stratified_sampling: bool = True
+    # Per-sample MSE multiplier keyed by phase id; defaults to equal.
+    phase_loss_weights: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     weight_decay: float = 1e-5
     log_every: int = 10
     save_every: int = 25
@@ -141,6 +145,7 @@ def train_bc(
     tr_phase = phase_t[tr_idx]
     val_obs = obs_t[val_idx]
     val_act = act_t[val_idx]
+    val_phase = phase_t[val_idx]
     del obs_t, act_t, phase_t
 
     if cfg.balance_phases:
@@ -152,11 +157,40 @@ def train_bc(
     else:
         sampler_weights = None
 
+    phase_pools: list[torch.Tensor] = []
+    phase_per_batch: list[int] = []
+    if cfg.stratified_sampling and cfg.balance_phases:
+        bs = cfg.batch_size
+        raw = [max(0, int(round(w * bs))) for w in cfg.phase_target_weights]
+        delta = sum(raw) - bs
+        if delta != 0:
+            step = -1 if delta > 0 else 1
+            for _ in range(abs(delta)):
+                i = max(range(NUM_PHASES), key=lambda k: raw[k]) if delta > 0 else min(range(NUM_PHASES), key=lambda k: raw[k])
+                raw[i] += step
+        phase_per_batch = raw
+        for p in range(NUM_PHASES):
+            pool = (tr_phase == p).nonzero(as_tuple=False).squeeze(-1)
+            phase_pools.append(pool)
+            if phase_per_batch[p] > 0 and pool.numel() == 0:
+                print(f"[bc][WARN] phase {p} has 0 training rows; redistributing its {phase_per_batch[p]} slots to other phases", flush=True)
+                for q in sorted(range(NUM_PHASES), key=lambda k: -phase_pools[k].numel() if k < len(phase_pools) else 0):
+                    if q < len(phase_pools) and phase_pools[q].numel() > 0 and q != p:
+                        phase_per_batch[q] += phase_per_batch[p]
+                        phase_per_batch[p] = 0
+                        break
+        print(f"[bc] stratified sampler: per-batch rows (walk,pick,carry,drop) = {phase_per_batch}", flush=True)
+
+    loss_w_per_sample: Optional[torch.Tensor] = None
+    if any(abs(w - 1.0) > 1e-8 for w in cfg.phase_loss_weights):
+        plw = torch.tensor(cfg.phase_loss_weights, dtype=torch.float32, device=device)
+        loss_w_per_sample = plw[tr_phase]
+        print(f"[bc] phase_loss_weights active: (walk,pick,carry,drop) = {cfg.phase_loss_weights}", flush=True)
+
     student = MonolithicPolicyStudent(obs_dim=obs.shape[1], act_dim=act.shape[1]).to(device)
     student.normalizer.update(tr_obs)
 
     optim = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    loss_fn = nn.MSELoss()
 
     ts = time.strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = Path(log_dir) if log_dir is not None else DEFAULT_LOG_ROOT / ts
@@ -177,31 +211,56 @@ def train_bc(
         epoch_loss_sum = torch.zeros((), device=device)
         epoch_seen = 0
         for _ in range(batches_per_epoch):
-            if sampler_weights is not None:
+            if phase_pools:
+                parts = []
+                for p in range(NUM_PHASES):
+                    k = phase_per_batch[p]
+                    pool = phase_pools[p]
+                    if k == 0 or pool.numel() == 0:
+                        continue
+                    draw = torch.randint(0, pool.numel(), (k,), device=device)
+                    parts.append(pool[draw])
+                idx = torch.cat(parts, dim=0)
+            elif sampler_weights is not None:
                 idx = torch.multinomial(sampler_weights, cfg.batch_size, replacement=True)
             else:
                 idx = torch.randint(0, n_tr, (cfg.batch_size,), device=device)
             x = tr_obs[idx]
             y = tr_act[idx]
             pred = student(x)
-            loss = loss_fn(pred, y)
+            err2 = (pred - y).pow(2).mean(dim=-1)
+            if loss_w_per_sample is not None:
+                w = loss_w_per_sample[idx]
+                loss = (err2 * w).sum() / w.sum().clamp(min=1e-8)
+            else:
+                loss = err2.mean()
             optim.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(student.parameters(), max_norm=5.0)
             optim.step()
-            epoch_loss_sum = epoch_loss_sum + loss.detach() * cfg.batch_size
-            epoch_seen += cfg.batch_size
+            epoch_loss_sum = epoch_loss_sum + loss.detach() * idx.numel()
+            epoch_seen += idx.numel()
         train_loss = (epoch_loss_sum / max(1, epoch_seen)).item()
 
         student.eval()
         with torch.no_grad():
             v_sum = torch.zeros((), device=device)
             v_seen = 0
+            # Per-phase val MSE: aggregate hides pick/drop regression (walk+carry ~93% of rows).
+            per_phase_sq = torch.zeros(NUM_PHASES, device=device)
+            per_phase_cnt = torch.zeros(NUM_PHASES, device=device)
+            ones = torch.ones(cfg.batch_size, device=device)
             for s in range(0, n_val, cfg.batch_size):
                 e = min(s + cfg.batch_size, n_val)
-                v_sum = v_sum + loss_fn(student(val_obs[s:e]), val_act[s:e]) * (e - s)
+                pred = student(val_obs[s:e])
+                err2 = (pred - val_act[s:e]).pow(2).mean(dim=-1)
+                v_sum = v_sum + err2.sum()
                 v_seen += (e - s)
+                ph_slice = val_phase[s:e].long()
+                per_phase_sq.index_add_(0, ph_slice, err2)
+                per_phase_cnt.index_add_(0, ph_slice, ones[: e - s])
             val_loss = (v_sum / max(1, v_seen)).item()
+            per_phase_mse = (per_phase_sq / per_phase_cnt.clamp(min=1)).detach().cpu().numpy()
 
         epoch_s = time.time() - t_epoch_start
         ewma_epoch_s = epoch_s if ewma_epoch_s is None else 0.9 * ewma_epoch_s + 0.1 * epoch_s
@@ -210,6 +269,9 @@ def train_bc(
 
         writer.add_scalar("BC/train_loss", train_loss, epoch)
         writer.add_scalar("BC/val_loss", val_loss, epoch)
+        for p, name in enumerate(("walk", "pick", "carry", "drop")):
+            if per_phase_cnt[p].item() > 0:
+                writer.add_scalar(f"BC/val_loss_{name}", float(per_phase_mse[p]), epoch)
         writer.add_scalar("Perf/epoch_s", epoch_s, epoch)
         writer.add_scalar("Perf/elapsed_s", elapsed_s, epoch)
         writer.add_scalar("Perf/eta_s", eta_s, epoch)

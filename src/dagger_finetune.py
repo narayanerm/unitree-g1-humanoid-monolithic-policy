@@ -102,6 +102,10 @@ class DAggerConfig:
     carry_snapshot_buffer_size: int = 2048
     drop_snapshot_buffer_size: int = 1024
     walk_terminal_buffer_path: str = "outputs/walk_terminal_states.npz"
+    # Pre-collected drop-fire poses (see scripts/collect_phase_data.py). Without this file, drop_reset_fraction
+    # is a no-op in round 0 because drop_buffer only grows once the student organically reaches drop.
+    drop_terminal_buffer_path: str = "outputs/drop_terminal_states.npz"
+    persist_drop_buffer: bool = True
 
     # Phase-stratified cap on BC-seed transitions (0 keeps all); for low-VRAM GPUs.
     bc_seed_max_transitions: int = 0
@@ -338,6 +342,40 @@ class CarryStateBuffer:
             self.cursor = (self.cursor + 1) % self.capacity
             if self.n_filled < self.capacity:
                 self.n_filled += 1
+
+    _NPZ_FIELDS = (
+        "robot_pose", "robot_vel", "joint_pos", "joint_vel",
+        "box_pose", "box_vel", "approach_xy",
+        "place_target_pos_w", "place_target_quat_w",
+        "object_target_pos_w", "object_target_quat_w",
+    )
+
+    def save_to_npz(self, path: Path | str) -> None:
+        """Persist the filled slots to disk."""
+        if self.n_filled == 0:
+            return
+        import numpy as np
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        n = self.n_filled
+        payload = {f: getattr(self, f)[:n].detach().cpu().numpy() for f in self._NPZ_FIELDS}
+        np.savez(str(p), **payload)
+
+    def load_from_npz(self, path: Path | str) -> int:
+        """Append up to capacity snapshots from a .npz written by save_to_npz, wrapping on overflow."""
+        import numpy as np
+        arr = np.load(str(path))
+        n = int(arr["robot_pose"].shape[0])
+        if n == 0:
+            return 0
+        take = min(n, self.capacity)
+        dst_idx = (torch.arange(take, device=self.device) + self.cursor) % self.capacity
+        for f in self._NPZ_FIELDS:
+            tensor = torch.from_numpy(arr[f][:take]).to(self.device)
+            getattr(self, f)[dst_idx] = tensor
+        self.cursor = (self.cursor + take) % self.capacity
+        self.n_filled = min(self.capacity, self.n_filled + take)
+        return take
 
     def teleport_into(self, base_env, state: PhaseState, env_ids: torch.Tensor, buf_idx: torch.Tensor) -> None:
         """Overwrite the physics + phase + locked-target state of env_ids with the snapshots at buf_idx.
@@ -879,6 +917,15 @@ def dagger_finetune(
         capacity=cfg.drop_snapshot_buffer_size,
         num_joints=num_joints, device=device, target_phase_id=DROP_PHASE_ID,
     ) if cfg.drop_reset_fraction > 0.0 else None
+    # Seed drop_buffer so round-0 drop_reset_fraction has poses to teleport to.
+    if drop_buffer is not None:
+        drop_buf_path = Path(cfg.drop_terminal_buffer_path)
+        if drop_buf_path.exists():
+            loaded = drop_buffer.load_from_npz(drop_buf_path)
+            print(f"[dagger] pre-loaded drop_buffer with {loaded} poses from {drop_buf_path}", flush=True)
+        else:
+            print(f"[dagger] drop_terminal_buffer_path={drop_buf_path} not found; "
+                  f"drop_reset_fraction={cfg.drop_reset_fraction} will only kick in after drop_fires organically", flush=True)
     walk_buffer: Optional[WalkTerminalBuffer] = None
     if cfg.pick_reset_fraction > 0.0:
         try:
@@ -1031,6 +1078,8 @@ def dagger_finetune(
         )
         round_s = time.time() - t_round_start
         print(f"[dagger] round {round_idx} wall time: {_fmt_hms(round_s)}; current ckpt: {cur_ckpt}", flush=True)
+        if drop_buffer is not None and drop_buffer.size() > 0 and cfg.persist_drop_buffer:
+            drop_buffer.save_to_npz(cfg.drop_terminal_buffer_path)
 
         if round_idx > 0 and len(round_npz_paths) > cfg.buffer_window:
             # Drop files outside the sliding window to bound disk use.
